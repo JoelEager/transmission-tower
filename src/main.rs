@@ -604,22 +604,39 @@ fn run_app(args: Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Borrows the parent process's console, if one exists, so `--help`,
+/// `--version`, errors, and `--verbose` output are visible when the
+/// binary is launched from a terminal. No-op when launched from
+/// Explorer or a VPN hook — the app stays console-free.
+#[cfg(target_os = "windows")]
+fn attach_parent_console() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AttachConsole(dwProcessId: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn setup_verbose_console() {
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn AttachConsole(dwProcessId: u32) -> i32;
         fn AllocConsole() -> i32;
+        fn GetConsoleWindow() -> *mut std::ffi::c_void;
     }
-    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
     unsafe {
-        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+        if GetConsoleWindow().is_null() {
             AllocConsole();
         }
     }
 }
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "windows")]
+    attach_parent_console();
     let args = Args::parse();
     if let Err(err) = run_app(args) {
         eprintln!("Error: {}", err);
