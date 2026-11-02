@@ -27,7 +27,13 @@ Note that `rpc-enabled` persists in `settings.json`, so Transmission's localhost
 Disable the whole feature with `--no-dashboard`; change the dashboard port with `--dashboard-port`.
 
 # Transmission Tower
-Session companion for [Transmission](https://github.com/transmission/transmission): applies the VPN forwarded port to `settings.json`, enables a localhost-only RPC server, launches the client, and serves a live dashboard (see below) while it runs. Session totals are appended to a log file for troubleshooting and history.
+Session companion for [Transmission](https://github.com/transmission/transmission): applies the VPN forwarded port to `settings.json`, enables a localhost-only RPC server, launches the client, and serves a live dashboard (see below) while it runs.
+
+All state lives in a data directory — `~/.transmission-tower` by default, override with `--data-dir`:
+
+- `config.json` — created on first start, populated with the default value for every CLI option. Values set here apply on future runs; passing an option on the command line overrides the config file.
+- `history.jsonl` — one machine-readable JSON line appended per Transmission session with start/end times, exit code, runtime, and bytes downloaded/uploaded.
+- `transmission-tower.log` — human-readable log for troubleshooting.
 
 Designed to run from a VPN's "launch an app after connecting" hook (e.g. Proton VPN's "Connect and Go" profile) — copy the forwarded port to the clipboard and it takes care of the rest. The port can also be passed directly with `--port`.
 

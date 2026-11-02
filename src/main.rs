@@ -3,6 +3,7 @@
 mod dashboard;
 mod rpc;
 
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -10,9 +11,9 @@ use std::process::{Command, ExitCode};
 use std::sync::{Arc, Mutex};
 
 use arboard::Clipboard;
-use chrono::Local;
+use chrono::{DateTime, Local};
 use clap::Parser;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 #[derive(Parser, Debug)]
@@ -32,9 +33,10 @@ pub struct Args {
     #[arg(long)]
     pub transmission_path: Option<PathBuf>,
 
-    /// Path to the log file. Defaults to `~/.transmission-tower.log`.
+    /// Directory holding the config file, session history, and log file.
+    /// Defaults to `~/.transmission-tower`.
     #[arg(long)]
-    pub log_file: Option<PathBuf>,
+    pub data_dir: Option<PathBuf>,
 
     /// Override port value directly instead of reading from clipboard.
     #[arg(long)]
@@ -52,9 +54,9 @@ pub struct Args {
     #[arg(long)]
     pub no_dashboard: bool,
 
-    /// Localhost port for the session dashboard server.
-    #[arg(long, default_value_t = 9191)]
-    pub dashboard_port: u16,
+    /// Localhost port for the session dashboard server. Defaults to 9191.
+    #[arg(long)]
+    pub dashboard_port: Option<u16>,
 
     /// Username for Transmission RPC authentication (only needed if authentication is enabled in Transmission).
     #[arg(long)]
@@ -94,10 +96,86 @@ impl Logger {
     }
 }
 
-fn default_log_file() -> Result<PathBuf, String> {
+fn default_data_dir() -> Result<PathBuf, String> {
     dirs::home_dir()
-        .map(|home| home.join(".transmission-tower.log"))
+        .map(|home| home.join(".transmission-tower"))
         .ok_or_else(|| "Could not determine user home directory".to_string())
+}
+
+/// Values read from `<data-dir>/config.json`. Every field is optional:
+/// absent or null falls back to the built-in default. Keys not listed
+/// here are collected in `extra` so they can be called out in the log
+/// rather than silently ignored (a typo'd key would otherwise look like
+/// a working setting).
+#[derive(Debug, Default, Deserialize)]
+struct FileConfig {
+    config_dir: Option<PathBuf>,
+    transmission_path: Option<PathBuf>,
+    port: Option<u16>,
+    skip_launch: Option<bool>,
+    verbose: Option<bool>,
+    no_dashboard: Option<bool>,
+    dashboard_port: Option<u16>,
+    rpc_username: Option<String>,
+    rpc_password: Option<String>,
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
+}
+
+/// Effective settings after merging CLI arguments over the config file.
+/// Anything the CLI explicitly supplies wins; everything else comes from
+/// the config file, falling back to the built-in defaults.
+struct Settings {
+    config_dir: PathBuf,
+    transmission_path: PathBuf,
+    port: Option<u16>,
+    skip_launch: bool,
+    verbose: bool,
+    no_dashboard: bool,
+    dashboard_port: u16,
+    rpc_username: Option<String>,
+    rpc_password: Option<String>,
+}
+
+fn resolve_settings(args: &Args, cfg: &FileConfig) -> Result<Settings, String> {
+    Ok(Settings {
+        config_dir: match args.config_dir.clone().or_else(|| cfg.config_dir.clone()) {
+            Some(dir) => dir,
+            None => default_config_dir()?,
+        },
+        transmission_path: args
+            .transmission_path
+            .clone()
+            .or_else(|| cfg.transmission_path.clone())
+            .unwrap_or_else(default_transmission_path),
+        port: args.port.or(cfg.port),
+        skip_launch: args.skip_launch || cfg.skip_launch.unwrap_or(false),
+        verbose: args.verbose || cfg.verbose.unwrap_or(false),
+        no_dashboard: args.no_dashboard || cfg.no_dashboard.unwrap_or(false),
+        dashboard_port: args.dashboard_port.or(cfg.dashboard_port).unwrap_or(9191),
+        rpc_username: args.rpc_username.clone().or(cfg.rpc_username.clone()),
+        rpc_password: args.rpc_password.clone().or(cfg.rpc_password.clone()),
+    })
+}
+
+/// Writes the initial config file populated with the built-in defaults.
+/// `port` stays null to mean "read the forwarded port from the clipboard".
+fn write_default_config(path: &Path) -> Result<(), String> {
+    let defaults = json!({
+        "config_dir": default_config_dir().ok(),
+        "transmission_path": default_transmission_path(),
+        "port": null,
+        "skip_launch": false,
+        "verbose": false,
+        "no_dashboard": false,
+        "dashboard_port": 9191,
+        "rpc_username": null,
+        "rpc_password": null
+    });
+    let mut body = serde_json::to_string_pretty(&defaults)
+        .map_err(|e| format!("Failed to serialize default config: {}", e))?;
+    body.push('\n');
+    fs::write(path, body).map_err(|e| format!("Failed to write {}: {}", path.display(), e))
 }
 
 fn default_config_dir() -> Result<PathBuf, String> {
@@ -130,9 +208,11 @@ fn get_port_from_clipboard() -> Result<u16, String> {
         return Err("Clipboard is empty".to_string());
     }
 
+    // Never echo the clipboard contents into the log — it usually holds
+    // something unrelated when this check fails.
     let port: u16 = trimmed
         .parse()
-        .map_err(|_| format!("Invalid port number in clipboard: '{}'", trimmed))?;
+        .map_err(|_| "Clipboard content is not a valid port number".to_string())?;
 
     if port == 0 {
         return Err("Port number cannot be 0".to_string());
@@ -262,13 +342,12 @@ fn update_settings_file(
     Ok(rpc_port)
 }
 
-fn run_app_logic(args: &Args, logger: &Logger) -> Result<(), String> {
-    let config_dir = match &args.config_dir {
-        Some(dir) => dir.clone(),
-        None => default_config_dir()?,
-    };
-
-    let port = match args.port {
+fn run_app_logic(
+    settings: &Settings,
+    history_path: &Path,
+    logger: &Logger,
+) -> Result<(), String> {
+    let port = match settings.port {
         Some(p) => {
             if p == 0 {
                 return Err("Port number cannot be 0".to_string());
@@ -282,22 +361,19 @@ fn run_app_logic(args: &Args, logger: &Logger) -> Result<(), String> {
         }
     };
 
-    let dashboard_enabled = !args.no_dashboard && !args.skip_launch;
-    let rpc_port = update_settings_file(&config_dir, port, dashboard_enabled, logger)?;
+    let dashboard_enabled = !settings.no_dashboard && !settings.skip_launch;
+    let rpc_port = update_settings_file(&settings.config_dir, port, dashboard_enabled, logger)?;
 
-    if args.skip_launch {
+    if settings.skip_launch {
         logger.log("Transmission launch skipped per --skip-launch flag");
         return Ok(());
     }
 
-    let trans_path = args
-        .transmission_path
-        .clone()
-        .unwrap_or_else(default_transmission_path);
-    let start_time = Local::now().format("%Y-%m-%d %H:%M:%S");
+    let trans_path = settings.transmission_path.clone();
+    let started_at = Local::now();
     logger.log(&format!(
         "Starting Transmission at {} ({})",
-        start_time,
+        started_at.format("%Y-%m-%d %H:%M:%S"),
         trans_path.display()
     ));
 
@@ -305,15 +381,19 @@ fn run_app_logic(args: &Args, logger: &Logger) -> Result<(), String> {
     if dashboard_enabled {
         let client = Arc::new(rpc::RpcClient::new(
             rpc_port,
-            args.rpc_username.as_deref(),
-            args.rpc_password.as_deref(),
+            settings.rpc_username.as_deref(),
+            settings.rpc_password.as_deref(),
         ));
-        if let Some(url) = dashboard::spawn(args.dashboard_port, client, hub.clone(), logger) {
+        if let Some(url) = dashboard::spawn(settings.dashboard_port, client, hub.clone(), logger)
+        {
             dashboard::open_in_browser(&url, logger);
         }
     }
 
     let result = run_transmission(&trans_path, &hub, logger);
+    if let Ok(status) = &result {
+        append_history(history_path, started_at, Local::now(), *status, &hub, logger);
+    }
     // Tell any connected dashboards the host is going away. write_all lands
     // the frame in the kernel buffer, so it is delivered before the FIN when
     // process exit closes the sockets.
@@ -323,6 +403,48 @@ fn run_app_logic(args: &Args, logger: &Logger) -> Result<(), String> {
     };
     hub.lock().unwrap().broadcast("exit", &event);
     result.map(|_| ())
+}
+
+/// Appends one machine-readable JSON line per Transmission session to
+/// `history.jsonl`. Byte counts and runtime come from the last
+/// session-stats poll; they are null when RPC was never reachable.
+fn append_history(
+    path: &Path,
+    started_at: DateTime<Local>,
+    exited_at: DateTime<Local>,
+    exit_status: std::process::ExitStatus,
+    hub: &Mutex<dashboard::Hub>,
+    logger: &Logger,
+) {
+    let hub = hub.lock().unwrap();
+    let current = hub.session.as_ref().and_then(|s| s.get("current-stats"));
+    let stat = |key: &str| current.and_then(|c| c[key].as_u64());
+    let record = json!({
+        "started_at": started_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        "exited_at": exited_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        "exit_code": exit_status.code(),
+        "runtime_seconds": stat("secondsActive"),
+        "downloaded_bytes": stat("downloadedBytes"),
+        "uploaded_bytes": stat("uploadedBytes"),
+    });
+    drop(hub);
+
+    match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(mut file) => {
+            if let Err(e) = writeln!(file, "{}", record) {
+                logger.log(&format!(
+                    "Failed to write session history to {}: {}",
+                    path.display(),
+                    e
+                ));
+            }
+        }
+        Err(e) => logger.log(&format!(
+            "Failed to open session history {}: {}",
+            path.display(),
+            e
+        )),
+    }
 }
 
 fn run_transmission(
@@ -403,15 +525,74 @@ fn format_duration(seconds: f64) -> String {
 }
 
 fn run_app(args: Args) -> Result<(), String> {
-    let log_file = match &args.log_file {
-        Some(path) => path.clone(),
-        None => default_log_file()?,
+    let data_dir = match &args.data_dir {
+        Some(dir) => dir.clone(),
+        None => default_data_dir()?,
+    };
+    fs::create_dir_all(&data_dir).map_err(|e| {
+        format!(
+            "Failed to create data directory {}: {}",
+            data_dir.display(),
+            e
+        )
+    })?;
+
+    let config_path = data_dir.join("config.json");
+    let history_path = data_dir.join("history.jsonl");
+    let log_path = data_dir.join("transmission-tower.log");
+
+    // Messages buffered until the logger exists (the verbose setting can
+    // itself come from the config file being read here).
+    let mut pending_logs: Vec<String> = Vec::new();
+    if !config_path.exists() {
+        match write_default_config(&config_path) {
+            Ok(()) => pending_logs.push(format!("Created default config at {}", config_path.display())),
+            Err(e) => pending_logs.push(format!("WARNING: {}", e)),
+        }
+    }
+    let cfg: FileConfig = match fs::read_to_string(&config_path) {
+        Ok(content) => match serde_json::from_str(&content) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                pending_logs.push(format!(
+                    "WARNING: could not parse {}, falling back to defaults: {}",
+                    config_path.display(),
+                    e
+                ));
+                FileConfig::default()
+            }
+        },
+        // Unreadable after the create attempt above: defaults it is.
+        Err(e) => {
+            pending_logs.push(format!(
+                "WARNING: could not read {}, falling back to defaults: {}",
+                config_path.display(),
+                e
+            ));
+            FileConfig::default()
+        }
     };
 
-    let logger = Logger::new(log_file, args.verbose);
-    logger.writeln_file("=== transmission-tower invoked ===");
+    let settings = resolve_settings(&args, &cfg)?;
+    #[cfg(target_os = "windows")]
+    if settings.verbose {
+        setup_verbose_console();
+    }
 
-    if let Err(err) = run_app_logic(&args, &logger) {
+    let logger = Logger::new(log_path, settings.verbose);
+    logger.writeln_file("=== transmission-tower invoked ===");
+    for msg in pending_logs {
+        logger.log(&msg);
+    }
+    for key in cfg.extra.keys() {
+        logger.log(&format!(
+            "WARNING: ignoring unknown config key '{}' in {}",
+            key,
+            config_path.display()
+        ));
+    }
+
+    if let Err(err) = run_app_logic(&settings, &history_path, &logger) {
         logger.log(&format!("ERROR: {}", err));
         return Err(err);
     }
@@ -436,10 +617,6 @@ fn setup_verbose_console() {
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    if args.verbose {
-        #[cfg(target_os = "windows")]
-        setup_verbose_console();
-    }
     if let Err(err) = run_app(args) {
         eprintln!("Error: {}", err);
         if io::stdin().is_terminal() {
@@ -513,97 +690,120 @@ mod tests {
         assert_eq!(parsed["rpc-whitelist"], "127.0.0.1,::1");
     }
 
+    fn test_args(
+        config_dir: &Path,
+        data_dir: &Path,
+        port: Option<u16>,
+        skip_launch: bool,
+    ) -> Args {
+        Args {
+            config_dir: Some(config_dir.to_path_buf()),
+            transmission_path: None,
+            data_dir: Some(data_dir.to_path_buf()),
+            port,
+            skip_launch,
+            verbose: false,
+            no_dashboard: false,
+            dashboard_port: None,
+            rpc_username: None,
+            rpc_password: None,
+        }
+    }
+
     #[test]
-    fn test_default_log_file() {
+    fn test_default_data_dir() {
         let home = dirs::home_dir().expect("Home dir should be present in test env");
-        let expected = home.join(".transmission-tower.log");
-        assert_eq!(default_log_file().unwrap(), expected);
+        let expected = home.join(".transmission-tower");
+        assert_eq!(default_data_dir().unwrap(), expected);
     }
 
     #[test]
     fn test_run_app_with_port_override_and_skip_launch() {
         let dir = tempdir().unwrap();
+        let data_dir = tempdir().unwrap();
         let trans_dir = dir.path().join("transmission");
         fs::create_dir_all(&trans_dir).unwrap();
         let settings_file = trans_dir.join("settings.json");
 
         fs::write(&settings_file, r#"{"peer-port": 12345}"#).unwrap();
 
-        let log_file = dir.path().join("log.txt");
-
-        let args = Args {
-            config_dir: Some(dir.path().to_path_buf()),
-            transmission_path: None,
-            log_file: Some(log_file.clone()),
-            port: Some(60000),
-            skip_launch: true,
-            verbose: false,
-            no_dashboard: false,
-            dashboard_port: 9191,
-            rpc_username: None,
-            rpc_password: None,
-        };
-
+        let args = test_args(dir.path(), data_dir.path(), Some(60000), true);
         assert!(run_app(args).is_ok());
 
         let updated_content = fs::read_to_string(&settings_file).unwrap();
         let parsed: Value = serde_json::from_str(&updated_content).unwrap();
         assert_eq!(parsed["peer-port"], 60000);
 
-        let log_content = fs::read_to_string(&log_file).unwrap();
+        let log_content =
+            fs::read_to_string(data_dir.path().join("transmission-tower.log")).unwrap();
         assert!(log_content.contains("Successfully updated port to 60000"));
         assert!(log_content.contains("Transmission launch skipped"));
+    }
+
+    /// First start writes config.json populated with the defaults; on the
+    /// next run its values apply, and CLI arguments override them.
+    #[test]
+    fn test_config_created_then_merged_with_cli_overrides() {
+        let dir = tempdir().unwrap();
+        let data_dir = tempdir().unwrap();
+        let trans_dir = dir.path().join("transmission");
+        fs::create_dir_all(&trans_dir).unwrap();
+        fs::write(trans_dir.join("settings.json"), r#"{"peer-port": 1}"#).unwrap();
+
+        let args = test_args(dir.path(), data_dir.path(), Some(60000), true);
+        assert!(run_app(args).is_ok());
+
+        let config_path = data_dir.path().join("config.json");
+        let cfg_text = fs::read_to_string(&config_path).unwrap();
+        let cfg_json: Value = serde_json::from_str(&cfg_text).unwrap();
+        assert_eq!(cfg_json["dashboard_port"], 9191);
+        assert_eq!(cfg_json["verbose"], false);
+        assert!(cfg_json["port"].is_null());
+        assert!(cfg_json["transmission_path"].is_string());
+
+        // A config-provided value is used when the CLI doesn't supply it…
+        fs::write(&config_path, cfg_text.replace("9191", "4242")).unwrap();
+        let cfg: FileConfig =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let args = test_args(dir.path(), data_dir.path(), Some(60000), true);
+        let settings = resolve_settings(&args, &cfg).unwrap();
+        assert_eq!(settings.dashboard_port, 4242);
+        assert_eq!(settings.port, Some(60000));
+
+        // …and the CLI wins when both are present.
+        let mut args = test_args(dir.path(), data_dir.path(), Some(60000), true);
+        args.dashboard_port = Some(1111);
+        let settings = resolve_settings(&args, &cfg).unwrap();
+        assert_eq!(settings.dashboard_port, 1111);
     }
 
     #[test]
     fn test_run_app_missing_settings_file() {
         let dir = tempdir().unwrap();
-        let log_file = dir.path().join("log.txt");
+        let data_dir = tempdir().unwrap();
 
-        let args = Args {
-            config_dir: Some(dir.path().to_path_buf()),
-            transmission_path: None,
-            log_file: Some(log_file.clone()),
-            port: Some(60000),
-            skip_launch: true,
-            verbose: false,
-            no_dashboard: false,
-            dashboard_port: 9191,
-            rpc_username: None,
-            rpc_password: None,
-        };
-
+        let args = test_args(dir.path(), data_dir.path(), Some(60000), true);
         let result = run_app(args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Settings file does not exist"));
 
-        let log_content = fs::read_to_string(&log_file).unwrap();
+        let log_content =
+            fs::read_to_string(data_dir.path().join("transmission-tower.log")).unwrap();
         assert!(log_content.contains("ERROR: Settings file does not exist"));
     }
 
     #[test]
     fn test_port_zero_validation() {
         let dir = tempdir().unwrap();
-        let log_file = dir.path().join("log.txt");
+        let data_dir = tempdir().unwrap();
 
-        let args = Args {
-            config_dir: Some(dir.path().to_path_buf()),
-            transmission_path: None,
-            log_file: Some(log_file.clone()),
-            port: Some(0),
-            skip_launch: true,
-            verbose: false,
-            no_dashboard: false,
-            dashboard_port: 9191,
-            rpc_username: None,
-            rpc_password: None,
-        };
-
+        let args = test_args(dir.path(), data_dir.path(), Some(0), true);
         let result = run_app(args);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Port number cannot be 0");
 
-        let log_content = fs::read_to_string(&log_file).unwrap();
+        let log_content =
+            fs::read_to_string(data_dir.path().join("transmission-tower.log")).unwrap();
         assert!(log_content.contains("ERROR: Port number cannot be 0"));
     }
 
@@ -635,6 +835,8 @@ mod tests {
         assert!(log_content.contains("Attempt 1/2:"));
         assert!(log_content.contains("Attempt 2/2:"));
         assert!(log_content.contains("Failed to find a valid port on clipboard after 30 seconds."));
+        // The non-port clipboard value itself must not leak into the log.
+        assert!(!log_content.contains("not_a_port"));
     }
 
     #[test]
