@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -8,15 +8,148 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::Logger;
-use crate::rpc::{RpcClient, is_method_allowed};
+use crate::rpc::RpcClient;
 
-/// Spawns the local dashboard HTTP server on a background thread. Bound to
-/// localhost only; only whitelisted read-only RPC methods are proxied through.
-/// Returns the dashboard URL, or None if the port could not be bound.
+/// Shared dashboard state: the latest result of each RPC poll plus the set of
+/// SSE client streams subscribed to updates. The poller is the only writer;
+/// connection handler threads push newly subscribed streams and replay the
+/// snapshots to them.
+#[derive(Default)]
+pub struct Hub {
+    /// Latest `session-stats` arguments — also read at shutdown to log
+    /// session totals.
+    pub session: Option<Value>,
+    torrents: Option<Value>,
+    port: Option<Value>,
+    clients: Vec<TcpStream>,
+}
+
+impl Hub {
+    /// Sends one SSE frame to every subscribed client, dropping any whose
+    /// write fails (closed tab, dead socket).
+    pub fn broadcast(&mut self, event: &str, data: &Value) {
+        let frame = sse_frame(event, data);
+        self.clients
+            .retain_mut(|s| s.write_all(frame.as_bytes()).is_ok());
+    }
+
+    /// Writes the cached snapshot of each event stream so a freshly opened
+    /// page renders immediately instead of waiting for the next poll tick.
+    fn replay(&self, stream: &mut TcpStream) -> io::Result<()> {
+        for (event, value) in [
+            ("status", &self.session),
+            ("torrents", &self.torrents),
+            ("port", &self.port),
+        ] {
+            if let Some(v) = value {
+                stream.write_all(sse_frame(event, v).as_bytes())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A single SSE frame. `Value::to_string` emits single-line JSON, so `data`
+/// never needs splitting into multiple `data:` lines.
+fn sse_frame(event: &str, data: &Value) -> String {
+    format!("event: {}\ndata: {}\n\n", event, data)
+}
+
+/// Polls Transmission on the dashboard's schedule and pushes results to all
+/// SSE clients: `session-stats` every tick (1s), `torrent-get` every third
+/// tick (3s), and `port-test` once when the RPC server first answers.
+/// Transmission does not re-test the port during a session, so neither do we.
+struct Poller {
+    client: Arc<RpcClient>,
+    hub: Arc<Mutex<Hub>>,
+    baselines: Mutex<Option<HashMap<String, u64>>>,
+    port_tested: bool,
+    rpc_announced: bool,
+    tick: u64,
+}
+
+impl Poller {
+    fn new(client: Arc<RpcClient>, hub: Arc<Mutex<Hub>>) -> Self {
+        Self {
+            client,
+            hub,
+            baselines: Mutex::new(None),
+            port_tested: false,
+            rpc_announced: false,
+            tick: 0,
+        }
+    }
+
+    fn run(&mut self, logger: &Logger) {
+        loop {
+            self.tick_once(logger);
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    fn tick_once(&mut self, logger: &Logger) {
+        match self.client.session_stats() {
+            Ok(args) => {
+                if !self.rpc_announced {
+                    logger.log("Connected to Transmission RPC");
+                    self.rpc_announced = true;
+                }
+                let mut hub = self.hub.lock().unwrap();
+                hub.session = Some(args.clone());
+                hub.broadcast("status", &args);
+            }
+            Err(e) => self
+                .hub
+                .lock()
+                .unwrap()
+                .broadcast("status", &json!({ "error": e })),
+        }
+
+        // The port test fires once, gated on the first successful RPC call —
+        // Transmission's RPC server needs a moment to come up after launch,
+        // and a test attempted before then only reports a connection error.
+        if self.rpc_announced && !self.port_tested {
+            self.port_tested = true;
+            let mut result = json!({});
+            for proto in ["ipv4", "ipv6"] {
+                result[proto] = match self.client.port_test(proto) {
+                    Ok(true) => json!("open"),
+                    Ok(false) => json!("closed"),
+                    Err(_) => json!("unknown"),
+                };
+            }
+            let mut hub = self.hub.lock().unwrap();
+            hub.port = Some(result.clone());
+            hub.broadcast("port", &result);
+        }
+
+        if self.tick.is_multiple_of(3) {
+            match self.client.torrent_get() {
+                Ok(mut args) => {
+                    inject_session_upload(&mut args, &self.baselines);
+                    let mut hub = self.hub.lock().unwrap();
+                    hub.torrents = Some(args.clone());
+                    hub.broadcast("torrents", &args);
+                }
+                Err(e) => self
+                    .hub
+                    .lock()
+                    .unwrap()
+                    .broadcast("torrents", &json!({ "error": e })),
+            }
+        }
+        self.tick += 1;
+    }
+}
+
+/// Spawns the local dashboard HTTP server and the RPC poller on background
+/// threads. Bound to localhost only; the page receives every poll result over
+/// a server-sent events stream. Returns the dashboard URL, or None if the
+/// port could not be bound.
 pub fn spawn(
     port: u16,
     client: Arc<RpcClient>,
-    stats_cache: Arc<Mutex<Option<Value>>>,
+    hub: Arc<Mutex<Hub>>,
     logger: &Logger,
 ) -> Option<String> {
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
@@ -31,21 +164,14 @@ pub fn spawn(
     };
 
     let hostname = detect_hostname();
-    // Baselines for per-torrent session upload, filled in by the first
-    // torrent-get response the proxy forwards.
-    let baselines: Arc<Mutex<Option<HashMap<String, u64>>>> = Arc::new(Mutex::new(None));
-
+    let accept_hub = Arc::clone(&hub);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    let client = Arc::clone(&client);
-                    let cache = Arc::clone(&stats_cache);
-                    let baselines = Arc::clone(&baselines);
+                    let hub = Arc::clone(&accept_hub);
                     let hostname = hostname.clone();
-                    std::thread::spawn(move || {
-                        handle_conn(stream, &client, &cache, &baselines, &hostname)
-                    });
+                    std::thread::spawn(move || handle_conn(stream, &hub, &hostname));
                 }
                 // Transient accept errors (e.g. fd exhaustion) would
                 // otherwise spin the accept loop.
@@ -53,6 +179,9 @@ pub fn spawn(
             }
         }
     });
+
+    let poll_logger = logger.clone();
+    std::thread::spawn(move || Poller::new(client, hub).run(&poll_logger));
 
     Some(format!("http://127.0.0.1:{}/", port))
 }
@@ -82,21 +211,13 @@ fn detect_hostname() -> String {
         .unwrap_or_else(|| "localhost".to_string())
 }
 
-fn handle_conn(
-    mut stream: TcpStream,
-    client: &RpcClient,
-    stats_cache: &Mutex<Option<Value>>,
-    baselines: &Mutex<Option<HashMap<String, u64>>>,
-    hostname: &str,
-) {
-    // Idle keep-alive connections are dropped after this. The dashboard
-    // polls every 2 s, so pooled connections stay busy while the page is
-    // open, and browsers discard pooled sockets the server has closed, so
-    // an expiring idle connection costs at most one reconnect.
+fn handle_conn(mut stream: TcpStream, hub: &Mutex<Hub>, hostname: &str) {
+    // Idle keep-alive connections are dropped after this. SSE streams are
+    // unaffected — they leave this function as soon as they're registered.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(75)));
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
     loop {
-        let Some((method, path, version, headers, body)) = read_request(&mut stream, &mut buf)
+        let Some((method, path, version, headers, _body)) = read_request(&mut stream, &mut buf)
         else {
             return;
         };
@@ -104,79 +225,79 @@ fn handle_conn(
 
         // Reject requests that don't come from a loopback context: a browser
         // page on another origin can't read the response anyway (no CORS
-        // headers), but it could still trigger calls like port-test, and a
-        // DNS-rebinding page could otherwise read everything.
-        let (status, payload) = if !request_is_local(&headers) {
-            (
-                403u16,
-                json!({ "error": "forbidden origin" }).to_string(),
-            )
-        } else {
-            match (method.as_str(), path.as_str()) {
-                ("GET", "/") => (200u16, INDEX_HTML.replace("[hostname]", hostname)),
-                ("POST", "/rpc") => proxy_rpc(&body, client, stats_cache, baselines),
-                _ => (404, "not found".to_string()),
-            }
-        };
-
-        let content_type = if payload.starts_with('<') {
-            "text/html; charset=utf-8"
-        } else {
-            "application/json"
-        };
-        let header = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
-            status,
-            reason(status),
-            content_type,
-            payload.len(),
-            if keep_alive { "keep-alive" } else { "close" }
-        );
-        if stream.write_all(header.as_bytes()).is_err()
-            || stream.write_all(payload.as_bytes()).is_err()
-            || !keep_alive
-        {
+        // headers), and a DNS-rebinding page must not be able to subscribe
+        // to the event stream either.
+        if !request_is_local(&headers) {
+            write_response(
+                &mut stream,
+                403,
+                "application/json",
+                &json!({ "error": "forbidden origin" }).to_string(),
+                false,
+            );
             return;
+        }
+
+        match (method.as_str(), path.as_str()) {
+            ("GET", "/") => {
+                if !write_response(
+                    &mut stream,
+                    200,
+                    "text/html; charset=utf-8",
+                    &INDEX_HTML.replace("[hostname]", hostname),
+                    keep_alive,
+                ) {
+                    return;
+                }
+                if !keep_alive {
+                    return;
+                }
+            }
+            ("GET", "/events") => {
+                // The stream now lives in the hub; nothing more to do here.
+                subscribe_events(stream, hub);
+                return;
+            }
+            _ => {
+                write_response(&mut stream, 404, "text/plain", "not found", false);
+                return;
+            }
         }
     }
 }
 
-fn proxy_rpc(
-    body: &[u8],
-    client: &RpcClient,
-    stats_cache: &Mutex<Option<Value>>,
-    baselines: &Mutex<Option<HashMap<String, u64>>>,
-) -> (u16, String) {
-    let parsed: Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(e) => return (400, json!({ "error": e.to_string() }).to_string()),
-    };
-
-    let method = parsed["method"].as_str().unwrap_or("");
-    if !is_method_allowed(method) {
-        return (
-            403,
-            json!({ "error": format!("method '{}' is not allowed", method) }).to_string(),
-        );
+/// Upgrades the connection to an SSE stream and hands it to the hub.
+/// Returns false (connection dies) when the handshake or snapshot replay
+/// fails.
+fn subscribe_events(mut stream: TcpStream, hub: &Mutex<Hub>) -> bool {
+    const HEADER: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+    if stream.write_all(HEADER.as_bytes()).is_err() {
+        return false;
     }
-
-    let arguments = if parsed["arguments"].is_null() {
-        json!({})
-    } else {
-        parsed["arguments"].clone()
-    };
-
-    match client.call(method, arguments) {
-        Ok(mut args) => {
-            if method == "session-stats" {
-                *stats_cache.lock().unwrap() = Some(args.clone());
-            } else if method == "torrent-get" {
-                inject_session_upload(&mut args, baselines);
-            }
-            (200, args.to_string())
-        }
-        Err(e) => (502, json!({ "error": e }).to_string()),
+    let mut hub = hub.lock().unwrap();
+    if hub.replay(&mut stream).is_err() {
+        return false;
     }
+    hub.clients.push(stream);
+    true
+}
+
+fn write_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    payload: &str,
+    keep_alive: bool,
+) -> bool {
+    let header = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+        status,
+        reason(status),
+        content_type,
+        payload.len(),
+        if keep_alive { "keep-alive" } else { "close" }
+    );
+    stream.write_all(header.as_bytes()).is_ok() && stream.write_all(payload.as_bytes()).is_ok()
 }
 
 /// Adds `uploadedSeedingSession` to each seeding torrent: bytes uploaded
@@ -321,10 +442,9 @@ fn host_is_loopback(host: &str) -> bool {
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
-        400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
-        _ => "Bad Gateway",
+        _ => "Internal Server Error",
     }
 }
 
@@ -333,7 +453,6 @@ const INDEX_HTML: &str = include_str!("dashboard.html");
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     fn read_http_request(stream: &mut TcpStream) -> Option<Vec<u8>> {
         let mut buf = Vec::new();
@@ -360,8 +479,7 @@ mod tests {
     }
 
     /// Mock Transmission RPC: replies 409 with a session id until the client
-    /// echoes the session id back, then returns success. Used to verify the
-    /// proxy enforces the method allowlist.
+    /// echoes the session id back, then returns success.
     fn mock_rpc_server() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -393,18 +511,24 @@ mod tests {
         port
     }
 
-    fn post(port: u16, path: &str, body: &str) -> String {
-        post_with_headers(port, path, "Host: 127.0.0.1\r\n", body)
+    fn spawn_dashboard() -> (u16, Arc<Mutex<Hub>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = Logger::new(dir.path().join("log.txt"), false);
+        let client = Arc::new(RpcClient::new(mock_rpc_server(), None, None));
+        let hub = Arc::new(Mutex::new(Hub::default()));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dash_port = listener.local_addr().unwrap().port();
+        drop(listener);
+        spawn(dash_port, client, hub.clone(), &logger).unwrap();
+        (dash_port, hub)
     }
 
-    fn post_with_headers(port: u16, path: &str, headers: &str, body: &str) -> String {
+    fn get_with_headers(port: u16, path: &str, headers: &str) -> String {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let req = format!(
-            "POST {} HTTP/1.1\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-            path,
-            headers,
-            body.len(),
-            body
+            "GET {} HTTP/1.1\r\n{}Connection: close\r\n\r\n",
+            path, headers
         );
         stream.write_all(req.as_bytes()).unwrap();
         let mut resp = String::new();
@@ -412,51 +536,8 @@ mod tests {
         resp
     }
 
-    #[test]
-    fn test_dashboard_serves_index_and_proxies_allowed_method() {
-        let dir = tempfile::tempdir().unwrap();
-        let logger = Logger::new(dir.path().join("log.txt"), false);
-        let rpc_port = mock_rpc_server();
-        let client = Arc::new(RpcClient::new(rpc_port, None, None));
-        let cache = Arc::new(Mutex::new(None));
-
-        // Bind a real dashboard port by retrying spawn on an OS-assigned one.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let dash_port = listener.local_addr().unwrap().port();
-        drop(listener);
-
-        let url = spawn(dash_port, client, cache.clone(), &logger).unwrap();
-        assert_eq!(url, format!("http://127.0.0.1:{}/", dash_port));
-
-        // Index page
-        let mut stream = TcpStream::connect(("127.0.0.1", dash_port)).unwrap();
-        stream
-            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-            .unwrap();
-        let mut resp = String::new();
-        stream.read_to_string(&mut resp).unwrap();
-        assert!(resp.contains("200 OK"));
-        assert!(resp.contains("Transmission visualization"));
-        assert!(!resp.contains("[hostname]"));
-
-        // Allowed method is proxied
-        let resp = post(
-            dash_port,
-            "/rpc",
-            r#"{"method":"session-stats","arguments":{}}"#,
-        );
-        assert!(resp.contains("200 OK"), "{}", resp);
-        assert!(resp.contains("\"ok\":true"));
-        assert!(cache.lock().unwrap().is_some());
-
-        // Disallowed method is rejected before reaching Transmission
-        let resp = post(
-            dash_port,
-            "/rpc",
-            r#"{"method":"torrent-remove","arguments":{"ids":[1]}}"#,
-        );
-        assert!(resp.contains("403"), "{}", resp);
-        assert!(resp.contains("not allowed"));
+    fn get(port: u16, path: &str) -> String {
+        get_with_headers(port, path, "Host: 127.0.0.1\r\n")
     }
 
     /// Reads one HTTP response (headers plus Content-Length body) without
@@ -486,49 +567,175 @@ mod tests {
     }
 
     #[test]
-    fn test_dashboard_keep_alive_serves_multiple_requests() {
-        let dir = tempfile::tempdir().unwrap();
-        let logger = Logger::new(dir.path().join("log.txt"), false);
-        let rpc_port = mock_rpc_server();
-        let client = Arc::new(RpcClient::new(rpc_port, None, None));
-        let cache = Arc::new(Mutex::new(None));
+    fn test_dashboard_serves_index() {
+        let (dash_port, _hub) = spawn_dashboard();
 
+        let resp = get(dash_port, "/");
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("<title>Transmission Tower</title>"));
+        assert!(!resp.contains("[hostname]"));
+    }
+
+    /// Subscribing to /events yields an SSE stream that carries the
+    /// poller's first-tick broadcasts (status + torrents + the one-time
+    /// port event) plus anything broadcast through the hub later.
+    #[test]
+    fn test_dashboard_events_stream_receives_poll_events() {
+        let (dash_port, hub) = spawn_dashboard();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", dash_port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .write_all(b"GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .unwrap();
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !(String::from_utf8_lossy(&buf).contains("event: port")
+            && String::from_utf8_lossy(&buf).contains("event: torrents"))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for poll events; got: {}",
+                String::from_utf8_lossy(&buf)
+            );
+            let n = stream.read(&mut chunk).unwrap();
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let text = String::from_utf8_lossy(&buf).to_string();
+        assert!(text.contains("200 OK"), "{}", text);
+        assert!(text.contains("text/event-stream"), "{}", text);
+        assert!(text.contains("event: status"), "{}", text);
+        assert!(text.contains("event: torrents"), "{}", text);
+        assert!(text.contains("event: port"), "{}", text);
+
+        // A broadcast through the hub reaches the subscribed stream.
+        hub.lock()
+            .unwrap()
+            .broadcast("status", &json!({"marker": 42}));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !String::from_utf8_lossy(&buf).contains("\"marker\":42") {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for broadcast");
+            let n = stream.read(&mut chunk).unwrap();
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    #[test]
+    fn test_hub_replay_sends_cached_snapshots() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let dash_port = listener.local_addr().unwrap().port();
-        drop(listener);
-        spawn(dash_port, client, cache, &logger).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut writer = TcpStream::connect(addr).unwrap();
+        let mut reader = listener.accept().unwrap().0;
+        reader
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let hub = Hub {
+            session: Some(json!({"a": 1})),
+            torrents: None,
+            port: Some(json!({"p": 2})),
+            clients: Vec::new(),
+        };
+        hub.replay(&mut writer).unwrap();
+        drop(writer);
+
+        let mut buf = String::new();
+        reader.read_to_string(&mut buf).unwrap();
+        assert!(buf.contains("event: status\ndata: {\"a\":1}"), "{}", buf);
+        assert!(buf.contains("event: port\ndata: {\"p\":2}"), "{}", buf);
+        assert!(!buf.contains("event: torrents"), "{}", buf);
+    }
+
+    #[test]
+    fn test_dashboard_keep_alive_serves_multiple_requests() {
+        let (dash_port, _hub) = spawn_dashboard();
 
         let mut stream = TcpStream::connect(("127.0.0.1", dash_port)).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        let body = r#"{"method":"session-stats","arguments":{}}"#;
 
         // HTTP/1.1 defaults to keep-alive: two requests on one connection.
         for _ in 0..2 {
-            let req = format!(
-                "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(req.as_bytes()).unwrap();
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .unwrap();
             let resp = read_http_response(&mut stream);
             assert!(resp.contains("200 OK"), "{}", resp);
-            assert!(resp.contains("\"ok\":true"));
             assert!(resp.contains("keep-alive"));
         }
 
         // Connection: close is honored and ends the exchange.
-        let req = format!(
-            "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(req.as_bytes()).unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
         let resp = read_http_response(&mut stream);
         assert!(resp.contains("200 OK"), "{}", resp);
         let mut rest = String::new();
         stream.read_to_string(&mut rest).unwrap();
+    }
+
+    #[test]
+    fn test_dashboard_rejects_non_loopback_host_and_origin() {
+        let (dash_port, _hub) = spawn_dashboard();
+
+        // DNS-rebinding style request: wrong Host
+        let resp = get_with_headers(dash_port, "/", "Host: evil.example\r\n");
+        assert!(resp.contains("403"), "{}", resp);
+
+        // Cross-origin page fetching localhost: right Host, wrong Origin
+        let resp = get_with_headers(
+            dash_port,
+            "/events",
+            "Host: 127.0.0.1\r\nOrigin: https://evil.example\r\n",
+        );
+        assert!(resp.contains("403"), "{}", resp);
+    }
+
+    /// One tick against the mock RPC pushes status, torrents, and the
+    /// one-time port event to every subscribed stream — and stores the
+    /// session snapshot for the exit log.
+    #[test]
+    fn test_poller_tick_broadcasts_poll_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = Logger::new(dir.path().join("log.txt"), false);
+        let client = Arc::new(RpcClient::new(mock_rpc_server(), None, None));
+        let hub = Arc::new(Mutex::new(Hub::default()));
+
+        // Socket pair standing in for an SSE subscriber.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_end = TcpStream::connect(addr).unwrap();
+        let mut server_end = listener.accept().unwrap().0;
+        server_end
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        hub.lock().unwrap().clients.push(client_end);
+
+        let mut poller = Poller::new(client, hub.clone());
+        poller.tick_once(&logger);
+
+        // Read until the port frame (written last this tick) arrives.
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !String::from_utf8_lossy(&buf).contains("event: port") {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            let n = server_end.read(&mut chunk).unwrap();
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let text = String::from_utf8_lossy(&buf).to_string();
+        assert!(text.contains("event: status\ndata: {\"ok\":true}"), "{}", text);
+        assert!(text.contains("event: torrents"), "{}", text);
+        assert!(text.contains("event: port"), "{}", text);
+        assert!(text.contains("\"ipv4\":\"closed\""), "{}", text);
+
+        assert!(hub.lock().unwrap().session.is_some());
+        assert!(poller.port_tested);
     }
 
     #[test]
@@ -562,37 +769,5 @@ mod tests {
             Some(750)
         );
         assert!(second["torrents"][1].get("uploadedSeedingSession").is_none());
-    }
-
-    #[test]
-    fn test_dashboard_rejects_non_loopback_host_and_origin() {
-        let dir = tempfile::tempdir().unwrap();
-        let logger = Logger::new(dir.path().join("log.txt"), false);
-        let rpc_port = mock_rpc_server();
-        let client = Arc::new(RpcClient::new(rpc_port, None, None));
-        let cache = Arc::new(Mutex::new(None));
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let dash_port = listener.local_addr().unwrap().port();
-        drop(listener);
-        spawn(dash_port, client, cache, &logger).unwrap();
-
-        // DNS-rebinding style request: wrong Host
-        let resp = post_with_headers(
-            dash_port,
-            "/rpc",
-            "Host: evil.example\r\n",
-            r#"{"method":"session-stats","arguments":{}}"#,
-        );
-        assert!(resp.contains("403"), "{}", resp);
-
-        // Cross-origin page POSTing to localhost: right Host, wrong Origin
-        let resp = post_with_headers(
-            dash_port,
-            "/rpc",
-            "Host: 127.0.0.1\r\nOrigin: https://evil.example\r\n",
-            r#"{"method":"session-stats","arguments":{}}"#,
-        );
-        assert!(resp.contains("403"), "{}", resp);
     }
 }

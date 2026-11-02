@@ -13,7 +13,7 @@ use arboard::Clipboard;
 use chrono::Local;
 use clap::Parser;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -65,6 +65,7 @@ pub struct Args {
     pub rpc_password: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct Logger {
     log_path: PathBuf,
     verbose: bool,
@@ -300,38 +301,35 @@ fn run_app_logic(args: &Args, logger: &Logger) -> Result<(), String> {
         trans_path.display()
     ));
 
-    let stats_cache: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
-    let rpc_client = if dashboard_enabled {
+    let hub: Arc<Mutex<dashboard::Hub>> = Arc::new(Mutex::new(dashboard::Hub::default()));
+    if dashboard_enabled {
         let client = Arc::new(rpc::RpcClient::new(
             rpc_port,
             args.rpc_username.as_deref(),
             args.rpc_password.as_deref(),
         ));
-        match dashboard::spawn(
-            args.dashboard_port,
-            client.clone(),
-            stats_cache.clone(),
-            logger,
-        ) {
-            Some(url) => {
-                dashboard::open_in_browser(&url, logger);
-                Some(client)
-            }
-            None => None,
+        if let Some(url) = dashboard::spawn(args.dashboard_port, client, hub.clone(), logger) {
+            dashboard::open_in_browser(&url, logger);
         }
-    } else {
-        None
-    };
+    }
 
-    run_transmission(&trans_path, rpc_client.as_deref(), &stats_cache, logger)
+    let result = run_transmission(&trans_path, &hub, logger);
+    // Tell any connected dashboards the host is going away. write_all lands
+    // the frame in the kernel buffer, so it is delivered before the FIN when
+    // process exit closes the sockets.
+    let event = match &result {
+        Ok(status) => json!({ "reason": "transmission exited", "code": status.code() }),
+        Err(e) => json!({ "reason": e }),
+    };
+    hub.lock().unwrap().broadcast("exit", &event);
+    result.map(|_| ())
 }
 
 fn run_transmission(
     trans_path: &Path,
-    rpc_client: Option<&rpc::RpcClient>,
-    stats_cache: &Mutex<Option<Value>>,
+    hub: &Mutex<dashboard::Hub>,
     logger: &Logger,
-) -> Result<(), String> {
+) -> Result<std::process::ExitStatus, String> {
     let mut child = Command::new(trans_path).spawn().map_err(|e| {
         format!(
             "Failed to launch Transmission at '{}': {}",
@@ -340,7 +338,6 @@ fn run_transmission(
         )
     })?;
 
-    let mut rpc_announced = false;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -350,17 +347,6 @@ fn run_transmission(
                 return Err(format!("Error waiting for Transmission: {}", e));
             }
         }
-
-        if let Some(client) = rpc_client
-            && let Ok(stats) = client.session_stats()
-        {
-            *stats_cache.lock().unwrap() = Some(stats);
-            if !rpc_announced {
-                logger.log("Connected to Transmission RPC");
-                rpc_announced = true;
-            }
-        }
-
         std::thread::sleep(std::time::Duration::from_secs(5));
     };
 
@@ -369,14 +355,14 @@ fn run_transmission(
         "Transmission exited at {} with {}",
         finish_time, status
     ));
-    log_session_totals(logger, stats_cache);
+    log_session_totals(logger, hub);
 
-    Ok(())
+    Ok(status)
 }
 
-fn log_session_totals(logger: &Logger, stats_cache: &Mutex<Option<Value>>) {
-    let cache = stats_cache.lock().unwrap();
-    match cache.as_ref().and_then(|s| s.get("current-stats")) {
+fn log_session_totals(logger: &Logger, hub: &Mutex<dashboard::Hub>) {
+    let hub = hub.lock().unwrap();
+    match hub.session.as_ref().and_then(|s| s.get("current-stats")) {
         Some(current) => {
             let downloaded = current["downloadedBytes"].as_f64().unwrap_or(0.0);
             let uploaded = current["uploadedBytes"].as_f64().unwrap_or(0.0);

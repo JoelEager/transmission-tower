@@ -3,13 +3,31 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-/// Read-only RPC methods the dashboard is allowed to proxy. Mutating methods
-/// (torrent-add, torrent-remove, session-set, etc.) are never forwarded.
-pub const ALLOWED_METHODS: [&str; 3] = ["session-stats", "torrent-get", "port-test"];
-
-pub fn is_method_allowed(method: &str) -> bool {
-    ALLOWED_METHODS.contains(&method)
-}
+/// Fields requested on every torrent-get poll; everything the dashboard
+/// renders comes from this list.
+const TORRENT_FIELDS: [&str; 21] = [
+    "id",
+    "name",
+    "status",
+    "percentDone",
+    "rateDownload",
+    "rateUpload",
+    "uploadedEver",
+    "downloadedEver",
+    "uploadRatio",
+    "eta",
+    "totalSize",
+    "addedDate",
+    "pieceCount",
+    "pieces",
+    "trackerStats",
+    "hashString",
+    "peers",
+    "peersFrom",
+    "peersConnected",
+    "peersSendingToUs",
+    "peersGettingFromUs",
+];
 
 pub struct RpcClient {
     agent: ureq::Agent,
@@ -69,6 +87,17 @@ impl RpcClient {
 
     pub fn session_stats(&self) -> Result<Value, String> {
         self.call("session-stats", json!({}))
+    }
+
+    pub fn torrent_get(&self) -> Result<Value, String> {
+        self.call("torrent-get", json!({ "fields": TORRENT_FIELDS }))
+    }
+
+    /// Asks Transmission's port-check service whether the forwarded peer
+    /// port is reachable. `ip_protocol` is "ipv4" or "ipv6".
+    pub fn port_test(&self, ip_protocol: &str) -> Result<bool, String> {
+        let args = self.call("port-test", json!({ "ip_protocol": ip_protocol }))?;
+        Ok(args["port-is-open"].as_bool().unwrap_or(false))
     }
 }
 
@@ -133,17 +162,6 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"user:pass"), "dXNlcjpwYXNz");
-    }
-
-    #[test]
-    fn test_is_method_allowed() {
-        assert!(is_method_allowed("session-stats"));
-        assert!(is_method_allowed("torrent-get"));
-        assert!(is_method_allowed("port-test"));
-        assert!(!is_method_allowed("torrent-add"));
-        assert!(!is_method_allowed("session-set"));
-        assert!(!is_method_allowed("torrent-remove"));
-        assert!(!is_method_allowed(""));
     }
 
     /// Reads one full HTTP request (headers plus Content-Length body) from the

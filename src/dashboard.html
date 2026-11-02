@@ -117,26 +117,6 @@
 </table>
 </div>
 <script>
-async function rpc(method, args) {
-  let r;
-  try {
-    r = await fetch('/rpc', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({method: method, arguments: args || {}})
-    });
-  } catch (e) {
-    // The fetch itself failed — either the embedded server is gone (the
-    // transmission-tower process exited) or the socket layer hiccuped;
-    // refresh() tells them apart after a few consecutive failures.
-    e.dashboardGone = true;
-    throw e;
-  }
-  const j = await r.json();
-  if (j.error) throw new Error(j.error);
-  return j;
-}
-
 function fmtBytes(n) {
   const u = ['B','KiB','MiB','GiB','TiB']; let i = 0;
   // 1023.95 promotes early so rounding never displays "1024.0 B"
@@ -161,20 +141,20 @@ function fmtShort(n) {
 
 
 
-// Checked once on page load; Transmission does not re-test the port during a session.
+// Pushed once by the server; Transmission does not re-test the port during
+// a session.
 const portStatus = {ipv4: 'unknown', ipv6: 'unknown'};
-async function checkPorts() {
-  for (const proto of ['ipv4', 'ipv6']) {
-    try {
-      const r = await rpc('port-test', {ip_protocol: proto});
-      portStatus[proto] = r['port-is-open'] ? 'open' : 'closed';
-    } catch (e) { /* keep 'unknown' */ }
-  }
+function renderPorts() {
+  const V = id => document.getElementById(id);
+  V('v-ipv4').textContent = portStatus.ipv4;
+  V('v-ipv4').className = 'v' + (portStatus.ipv4 === 'open' ? ' ok' : '');
+  V('v-ipv6').textContent = portStatus.ipv6;
+  V('v-ipv6').className = 'v' + (portStatus.ipv6 === 'open' ? ' ok' : '');
 }
 
 // ---- Speed history (kept in-page only, starts when the page opens) ----
-const speedHist = []; // one {d, u} sample per refresh tick
-const SPEED_HIST_MAX = 300; // ~10 minutes at 2s ticks
+const speedHist = []; // one {d, u} sample per status event (every second)
+const SPEED_HIST_MAX = 600; // ~10 minutes at 1s ticks
 const speedPeak = {d: 0, u: 0}; // session max — survives samples aging out of the window
 function pushSpeed(d, u) {
   speedHist.push({d, u});
@@ -243,10 +223,10 @@ function drawSpeedChart() {
     ctx.fillText(fmtShort(v) + '/s', pad + 2, Math.max(11, y(v) - 2));
   }
   ctx.textAlign = 'center';
-  for (let m = 5; m * 60 <= SPEED_HIST_MAX * 2; m += 5) {
+  for (let m = 5; m * 60 <= SPEED_HIST_MAX; m += 5) {
     const label = '-' + m + 'm';
     const half = ctx.measureText(label).width / 2;
-    const lx = Math.min(Math.max(x(SPEED_HIST_MAX - 1 - m * 30), pad + half), W - pad - half);
+    const lx = Math.min(Math.max(x(SPEED_HIST_MAX - 1 - m * 60), pad + half), W - pad - half);
     ctx.fillText(label, lx, H - pad - 1);
   }
   ctx.font = '11px system-ui';
@@ -802,121 +782,147 @@ document.getElementById('divider').addEventListener('mousedown', e => {
   document.addEventListener('mouseup', up);
 });
 
-let goneStreak = 0; // consecutive failed fetches to the embedded server
-async function refresh() {
-  const status = document.getElementById('status');
-  try {
-    const s = await rpc('session-stats');
-    const c = s['current-stats'] || {};
-    const cum = s['cumulative-stats'] || {};
-    const V = id => document.getElementById(id);
-    V('v-xfer').textContent = '↓' + fmtBytes(c.downloadedBytes || 0) + ' / ↑' + fmtBytes(c.uploadedBytes || 0);
-    V('v-sratio').textContent = fmtRatio(c.uploadedBytes, c.downloadedBytes);
-    V('v-stime').textContent = fmtDur(c.secondsActive || 0);
-    V('torhead').textContent = 'Active torrents (' + (s.activeTorrentCount || 0) + ')';
-    latestSpeeds.d = s.downloadSpeed || 0;
-    latestSpeeds.u = s.uploadSpeed || 0;
-    V('v-txfer').textContent = '↓' + fmtBytes(cum.downloadedBytes || 0) + ' / ↑' + fmtBytes(cum.uploadedBytes || 0);
-    V('v-tratio').textContent = fmtRatio(cum.uploadedBytes, cum.downloadedBytes);
-    V('v-ipv4').textContent = portStatus.ipv4;
-    V('v-ipv4').className = 'v' + (portStatus.ipv4 === 'open' ? ' ok' : '');
-    V('v-ipv6').textContent = portStatus.ipv6;
-    V('v-ipv6').className = 'v' + (portStatus.ipv6 === 'open' ? ' ok' : '');
-
-    const t = await rpc('torrent-get', {fields: ['id','name','status','percentDone','rateDownload','rateUpload',
-      'uploadedEver','downloadedEver','uploadRatio','eta','totalSize','addedDate','pieceCount','pieces','trackerStats',
-      'hashString','peers','peersFrom','peersConnected','peersSendingToUs','peersGettingFromUs']});
-    updateTorrents(t.torrents || []);
-    let connected = 0, sending = 0, getting = 0;
-    const sources = {};
-    const all = [];
-    const byPeer = new Map(); // address:port -> merged peer entry
-    for (const tor of t.torrents || []) {
-      connected += tor.peersConnected || 0;
-      sending += tor.peersSendingToUs || 0;
-      getting += tor.peersGettingFromUs || 0;
-      for (const k in tor.peersFrom || {}) sources[k] = (sources[k] || 0) + tor.peersFrom[k];
-      // the same peer can appear once per torrent; merge into a single
-      // entry summing rates and totals so the list counts machines
-      for (const p of tor.peers || []) {
-        const k = p.address + ':' + p.port;
-        let m = byPeer.get(k);
-        if (!m) {
-          m = Object.assign({}, p);
-          m.torrentCount = 0;
-          byPeer.set(k, m);
-          all.push(m);
-        } else {
-          m.rateToClient = (m.rateToClient || 0) + (p.rateToClient || 0);
-          m.rateToPeer = (m.rateToPeer || 0) + (p.rateToPeer || 0);
-          for (const f of ['bytesToClient', 'bytesToPeer', 'bytes_to_client', 'bytes_to_peer']) {
-            if (m[f] !== undefined || p[f] !== undefined) m[f] = (m[f] || 0) + (p[f] || 0);
-          }
-          m.progress = Math.min(m.progress || 0, p.progress || 0);
-          m.isIncoming = m.isIncoming || p.isIncoming;
-          m.isEncrypted = m.isEncrypted || p.isEncrypted;
-        }
-        m.torrentCount++;
-        (m.progressList || (m.progressList = [])).push(p.progress || 0);
-        (m.torrentIds || (m.torrentIds = new Set())).add(tor.id);
-      }
-    }
-    let inbound = 0, outbound = 0, seeders = 0, leechers = 0;
-    for (const p of all) {
-      if (p.isIncoming) inbound++; else outbound++;
-      if (p.progress >= 1) seeders++; else leechers++;
-    }
-    V('v-connected').textContent = connected + ' (' + inbound + ' in / ' + outbound + ' out)';
-    V('v-tofrom').textContent = sending + ' / ' + getting;
-    V('v-sdlch').textContent = seeders + ' / ' + leechers;
-    const SOURCE_LABELS = {fromTracker: 'tracker', fromDht: 'DHT', fromPex: 'PEX',
-      fromIncoming: 'incoming', fromLpd: 'LPD', fromLtep: 'LTEP',
-      fromHolepunch: 'holepunch', fromCache: 'resume'};
-    const SOURCE_TITLES = {fromTracker: 'tracker', fromDht: 'distributed hash table',
-      fromPex: 'peer exchange', fromIncoming: 'incoming connections',
-      fromLpd: 'local peer discovery', fromLtep: 'libtorrent extension protocol',
-      fromHolepunch: 'NAT hole punching', fromCache: 'resume file'};
-    const srcKeys = Object.keys(SOURCE_LABELS).filter(k => sources[k]);
-    const srcEl = V('v-sources');
-    srcEl.textContent = srcKeys.map(k => sources[k] + ' ' + SOURCE_LABELS[k]).join(' · ') || '—';
-    srcEl.title = srcKeys.map(k => sources[k] + ' ' + SOURCE_TITLES[k]).join(', ');
-    const peerTotal = p => {
-      const r = peerRows.get(p.address + ':' + p.port) || {};
-      return (p.bytes_to_client ?? r.down ?? 0) + (p.bytes_to_peer ?? r.up ?? 0);
-    };
-    all.sort((a, b) => peerTotal(b) - peerTotal(a));
-    updatePeerTable(all);
-    pushSpeed(s.downloadSpeed || 0, s.uploadSpeed || 0);
-    updateSwarm(all);
-    document.title = '↓' + fmtShort(s.downloadSpeed || 0) + '/s ' + fmtShort(c.downloadedBytes || 0)
-      + ' | ↑' + fmtShort(s.uploadSpeed || 0) + '/s ' + fmtShort(c.uploadedBytes || 0)
-      + ' | ' + fmtRatio(cum.uploadedBytes, cum.downloadedBytes);
-    status.textContent = '';
-    goneStreak = 0;
-  } catch (e) {
-    if (e && e.dashboardGone) {
-      // One failed fetch can be a transient socket error (e.g. the OS
-      // running out of buffer space), so only declare the host process
-      // dead after several consecutive failures.
-      if (++goneStreak < 3) {
-        status.textContent = 'Dashboard connection failed — retrying…';
-        return;
-      }
-      status.textContent = 'transmission-tower has exited; this dashboard is no longer updating. '
-        + 'Session totals were written to the log file.';
-      document.title = 'Transmission offline';
-      clearInterval(refreshTimer);
-      running = false;
-      return;
-    }
-    status.textContent = 'Transmission RPC unavailable: ' + e.message;
-  }
+const statusEl = document.getElementById('status');
+function rpcError(err) {
+  statusEl.textContent = 'Transmission RPC unavailable: ' + err;
 }
 
-refresh();
-checkPorts();
+// session-stats payload, pushed once a second
+function onStats(s) {
+  if (s.error) { rpcError(s.error); return; }
+  const c = s['current-stats'] || {};
+  const cum = s['cumulative-stats'] || {};
+  const V = id => document.getElementById(id);
+  V('v-xfer').textContent = '↓' + fmtBytes(c.downloadedBytes || 0) + ' / ↑' + fmtBytes(c.uploadedBytes || 0);
+  V('v-sratio').textContent = fmtRatio(c.uploadedBytes, c.downloadedBytes);
+  V('v-stime').textContent = fmtDur(c.secondsActive || 0);
+  V('torhead').textContent = 'Active torrents (' + (s.activeTorrentCount || 0) + ')';
+  latestSpeeds.d = s.downloadSpeed || 0;
+  latestSpeeds.u = s.uploadSpeed || 0;
+  V('v-txfer').textContent = '↓' + fmtBytes(cum.downloadedBytes || 0) + ' / ↑' + fmtBytes(cum.uploadedBytes || 0);
+  V('v-tratio').textContent = fmtRatio(cum.uploadedBytes, cum.downloadedBytes);
+  pushSpeed(s.downloadSpeed || 0, s.uploadSpeed || 0);
+  document.title = '↓' + fmtShort(s.downloadSpeed || 0) + '/s ' + fmtShort(c.downloadedBytes || 0)
+    + ' | ↑' + fmtShort(s.uploadSpeed || 0) + '/s ' + fmtShort(c.uploadedBytes || 0)
+    + ' | ' + fmtRatio(cum.uploadedBytes, cum.downloadedBytes);
+  statusEl.textContent = '';
+}
+
+// torrent-get payload, pushed every three seconds
+function onTorrents(t) {
+  if (t.error) { rpcError(t.error); return; }
+  const V = id => document.getElementById(id);
+  updateTorrents(t.torrents || []);
+  let connected = 0, sending = 0, getting = 0;
+  const sources = {};
+  const all = [];
+  const byPeer = new Map(); // address:port -> merged peer entry
+  for (const tor of t.torrents || []) {
+    connected += tor.peersConnected || 0;
+    sending += tor.peersSendingToUs || 0;
+    getting += tor.peersGettingFromUs || 0;
+    for (const k in tor.peersFrom || {}) sources[k] = (sources[k] || 0) + tor.peersFrom[k];
+    // the same peer can appear once per torrent; merge into a single
+    // entry summing rates and totals so the list counts machines
+    for (const p of tor.peers || []) {
+      const k = p.address + ':' + p.port;
+      let m = byPeer.get(k);
+      if (!m) {
+        m = Object.assign({}, p);
+        m.torrentCount = 0;
+        byPeer.set(k, m);
+        all.push(m);
+      } else {
+        m.rateToClient = (m.rateToClient || 0) + (p.rateToClient || 0);
+        m.rateToPeer = (m.rateToPeer || 0) + (p.rateToPeer || 0);
+        for (const f of ['bytesToClient', 'bytesToPeer', 'bytes_to_client', 'bytes_to_peer']) {
+          if (m[f] !== undefined || p[f] !== undefined) m[f] = (m[f] || 0) + (p[f] || 0);
+        }
+        m.progress = Math.min(m.progress || 0, p.progress || 0);
+        m.isIncoming = m.isIncoming || p.isIncoming;
+        m.isEncrypted = m.isEncrypted || p.isEncrypted;
+      }
+      m.torrentCount++;
+      (m.progressList || (m.progressList = [])).push(p.progress || 0);
+      (m.torrentIds || (m.torrentIds = new Set())).add(tor.id);
+    }
+  }
+  let inbound = 0, outbound = 0, seeders = 0, leechers = 0;
+  for (const p of all) {
+    if (p.isIncoming) inbound++; else outbound++;
+    if (p.progress >= 1) seeders++; else leechers++;
+  }
+  V('v-connected').textContent = connected + ' (' + inbound + ' in / ' + outbound + ' out)';
+  V('v-tofrom').textContent = sending + ' / ' + getting;
+  V('v-sdlch').textContent = seeders + ' / ' + leechers;
+  const SOURCE_LABELS = {fromTracker: 'tracker', fromDht: 'DHT', fromPex: 'PEX',
+    fromIncoming: 'incoming', fromLpd: 'LPD', fromLtep: 'LTEP',
+    fromHolepunch: 'holepunch', fromCache: 'resume'};
+  const SOURCE_TITLES = {fromTracker: 'tracker', fromDht: 'distributed hash table',
+    fromPex: 'peer exchange', fromIncoming: 'incoming connections',
+    fromLpd: 'local peer discovery', fromLtep: 'libtorrent extension protocol',
+    fromHolepunch: 'NAT hole punching', fromCache: 'resume file'};
+  const srcKeys = Object.keys(SOURCE_LABELS).filter(k => sources[k]);
+  const srcEl = V('v-sources');
+  srcEl.textContent = srcKeys.map(k => sources[k] + ' ' + SOURCE_LABELS[k]).join(' · ') || '—';
+  srcEl.title = srcKeys.map(k => sources[k] + ' ' + SOURCE_TITLES[k]).join(', ');
+  const peerTotal = p => {
+    const r = peerRows.get(p.address + ':' + p.port) || {};
+    return (p.bytes_to_client ?? r.down ?? 0) + (p.bytes_to_peer ?? r.up ?? 0);
+  };
+  all.sort((a, b) => peerTotal(b) - peerTotal(a));
+  updatePeerTable(all);
+  updateSwarm(all);
+  statusEl.textContent = '';
+}
+
+// The server polls Transmission itself — session-stats once a second,
+// torrent-get every three seconds, port-test once at startup — and pushes
+// each result here over server-sent events. A clean shutdown is announced
+// with an 'exit' event; the watchdog below only covers ungraceful ends
+// (killed process, dead socket) where no event could be sent.
+const evs = new EventSource('/events');
+let goneTimer = null;
+function clearGone() {
+  if (goneTimer) { clearTimeout(goneTimer); goneTimer = null; }
+}
+const EXIT_MSG = 'transmission-tower has exited; this dashboard is no longer updating. '
+  + 'Session totals were written to the log file.';
+function declareGone(msg) {
+  running = false;
+  evs.close();
+  statusEl.textContent = msg || EXIT_MSG;
+  document.title = 'Transmission offline';
+}
+evs.addEventListener('status', e => { clearGone(); onStats(JSON.parse(e.data)); });
+evs.addEventListener('torrents', e => { clearGone(); onTorrents(JSON.parse(e.data)); });
+evs.addEventListener('port', e => {
+  clearGone();
+  const p = JSON.parse(e.data);
+  if (p.ipv4) portStatus.ipv4 = p.ipv4;
+  if (p.ipv6) portStatus.ipv6 = p.ipv6;
+  renderPorts();
+});
+evs.addEventListener('exit', e => {
+  let msg = EXIT_MSG;
+  try {
+    const p = JSON.parse(e.data);
+    if (typeof p.code === 'number') {
+      msg = 'Transmission exited with code ' + p.code
+        + '; this dashboard is no longer updating. Session totals were written to the log file.';
+    }
+  } catch (_) {}
+  declareGone(msg);
+});
+evs.onopen = () => clearGone();
+evs.onerror = () => {
+  if (!running) return; // already declared gone by the 'exit' event
+  statusEl.textContent = 'Dashboard connection failed — retrying…';
+  if (!goneTimer) goneTimer = setTimeout(declareGone, 8000);
+};
+
+renderPorts();
 requestAnimationFrame(tick);
-const refreshTimer = setInterval(refresh, 2000);
 </script>
 </body>
 </html>
