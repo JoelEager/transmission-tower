@@ -381,7 +381,13 @@ fn run_app_logic(
             settings.rpc_username.as_deref(),
             settings.rpc_password.as_deref(),
         ));
-        if let Some(url) = dashboard::spawn(settings.dashboard_port, client, hub.clone(), logger)
+        if let Some(url) = dashboard::spawn(
+            settings.dashboard_port,
+            client,
+            hub.clone(),
+            history_path,
+            logger,
+        )
         {
             dashboard::open_in_browser(&url, logger);
         }

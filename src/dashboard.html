@@ -33,16 +33,35 @@
   #speedstats .slabel { color:#8b949e; margin-left:1rem; }
   #speedstats .dn { color:#5aa9e6; }
   #speedstats .up { color:#7ee2a8; }
-  #rangeseg { display:flex; border:1px solid #30363d; border-radius:5px;
-              overflow:hidden; background:#1c2127; flex-shrink:0; }
-  #rangeseg button { background:transparent; color:#8b949e; border:none;
-                     font-size:12px; padding:.2rem .8rem; cursor:pointer; }
-  #rangeseg button:hover { color:#d8dee4; }
-  #rangeseg button.on { background:#3a424d; color:#e6edf3; font-weight:600; }
-  #rangeseg button + button { border-left:1px solid #30363d; }
+  .seg { display:flex; border:1px solid #30363d; border-radius:5px;
+         overflow:hidden; background:#1c2127; flex-shrink:0; }
+  .seg button { background:transparent; color:#8b949e; border:none;
+                font-size:12px; padding:.2rem .8rem; cursor:pointer; }
+  .seg button:hover { color:#d8dee4; }
+  .seg button.on { background:#3a424d; color:#e6edf3; font-weight:600; }
+  .seg button + button { border-left:1px solid #30363d; }
+  #histbtn, #histback { background:#1c2127; color:#8b949e; border:1px solid #30363d; border-radius:5px;
+             font-size:12px; padding:.2rem .7rem; cursor:pointer; flex-shrink:0; }
+  #histbtn:hover, #histback:hover { color:#d8dee4; }
+  #histmodal { position:fixed; inset:0; background:rgba(0,0,0,.55); display:none;
+               align-items:center; justify-content:center; z-index:10; }
+  #histmodal.open { display:flex; }
+  #histcard { background:#1c2127; border:1px solid #30363d; border-radius:8px;
+              width:min(760px,92vw); padding:.8rem 1rem; box-shadow:0 8px 30px rgba(0,0,0,.5); }
+  #histhead { display:flex; align-items:center; gap:.6rem; margin-bottom:.3rem; }
+  #histhead h2 { flex:1; margin:0; font-size:1.05rem; }
+  #histclose { background:transparent; border:none; color:#8b949e; font-size:17px;
+               cursor:pointer; padding:.05rem .45rem; border-radius:4px; }
+  #histclose:hover { color:#e6edf3; background:#30363d; }
+  #histsum { font-size:12px; color:#8b949e; margin-bottom:.45rem; }
+  #histsum b { color:#d8dee4; font-weight:600; }
+  #histsum .dn { color:#5aa9e6; } #histsum .up { color:#7ee2a8; }
+  #histwrap { position:relative; }
+  #histchart { height:260px; }
+  #histlegend { font-size:12px; color:#8b949e; margin-top:.4rem; }
   #swarmwrap { position:relative; flex:1; min-height:0; }
   #swarm { height:100%; }
-  #tip { position:absolute; display:none; background:#1c2127; border:1px solid #444; border-radius:4px;
+  #tip, #histtip { position:absolute; display:none; background:#1c2127; border:1px solid #444; border-radius:4px;
          padding:.3rem .55rem; font-size:12px; line-height:1.4; pointer-events:none; white-space:pre; }
   #legend { font-size:12px; color:#8b949e; }
   .dot { display:inline-block; width:.6em; height:.6em; border-radius:50%; margin:0 .3em 0 .9em; vertical-align:middle; }
@@ -82,9 +101,10 @@
 <div id="speedbar">
 <div id="brand"><img src="/icon.svg" width="16" height="16" alt="">Transmission Tower</div>
 <div id="speedstats"><span class="slabel">Peak</span> <span class="dn" id="ss-peak-d"></span> <span class="up" id="ss-peak-u"></span><span class="slabel">Avg</span> <span class="dn" id="ss-avg-d"></span> <span class="up" id="ss-avg-u"></span></div>
-<div id="rangeseg">
+<div id="rangeseg" class="seg">
 <button data-range="win" title="Show the last 10 minutes">10m</button><button data-range="all" title="Show the whole session">All</button>
 </div>
+<button id="histbtn" title="Show per-day transfer history">History</button>
 </div>
 <canvas id="speedchart"></canvas>
 <div id="hdivider"></div>
@@ -138,6 +158,21 @@
 </tr></thead>
 <tbody></tbody>
 </table>
+</div>
+<div id="histmodal">
+  <div id="histcard">
+    <div id="histhead">
+      <h2>History</h2>
+      <button id="histback" title="Back to all days" hidden>← All days</button>
+      <div id="histseg" class="seg">
+        <button data-mode="vol">Totals</button><button data-mode="avg">Avg speed</button>
+      </div>
+      <button id="histclose" title="Close">×</button>
+    </div>
+    <div id="histsum"></div>
+    <div id="histwrap"><canvas id="histchart"></canvas><div id="histtip"></div></div>
+    <div id="histlegend"><span class="dot" style="background:#5aa9e6"></span>Downloaded<span class="dot" style="background:#7ee2a8"></span>Uploaded · Sessions on the same day are merged · Click a day for per-session detail · Hover a bar for details</div>
+  </div>
 </div>
 <script>
 function fmtBytes(n) {
@@ -877,6 +912,240 @@ document.getElementById('divider').addEventListener('mousedown', e => {
   document.addEventListener('mouseup', up);
 });
 
+// ---- Session history modal (file rows pushed as the 'sessions' event,
+// merged per calendar day; the running session is merged in from
+// session-stats so it updates live) ----
+const histModal = document.getElementById('histmodal');
+const histTip = document.getElementById('histtip');
+const histCanvas = document.getElementById('histchart');
+let histRecords = [], histDays = [], histRows = [], lastStats = null;
+let histDrill = null;   // "YYYY-MM-DD" while viewing one day's sessions
+const histBack = document.getElementById('histback');
+let histMode = 'vol';
+try { histMode = localStorage.getItem('histMode') === 'avg' ? 'avg' : 'vol'; } catch (e) {}
+
+const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function fmtDays(s) {
+  const d = Math.floor(s / 86400);
+  return d ? d + 'd ' + Math.floor(s % 86400 / 3600) + 'h' : fmtDur(s);
+}
+function localDay(t) {
+  const p = n => String(n).padStart(2, '0');
+  return t.getFullYear() + '-' + p(t.getMonth() + 1) + '-' + p(t.getDate());
+}
+function localStamp(t) {
+  const p = n => String(n).padStart(2, '0');
+  return localDay(t) + ' ' + p(t.getHours()) + ':' + p(t.getMinutes()) + ':' + p(t.getSeconds());
+}
+
+// The current session isn't in history.jsonl until Transmission exits;
+// synthesize its record from the latest session-stats push.
+function liveRecord() {
+  const c = lastStats && lastStats['current-stats'];
+  if (!c || c.secondsActive == null) return null;
+  return {
+    started_at: localStamp(new Date(Date.now() - c.secondsActive * 1000)),
+    runtime_seconds: c.secondsActive,
+    downloaded_bytes: c.downloadedBytes || 0,
+    uploaded_bytes: c.uploadedBytes || 0,
+    live: true,
+  };
+}
+
+// File records plus the synthesized live session — used by both the day
+// merge and the per-session drill view.
+function allRecords() {
+  const recs = histRecords.slice(), live = liveRecord();
+  if (live) recs.push(live);
+  return recs;
+}
+
+function histData() {
+  return mergeDays(allRecords());
+}
+
+function mergeDays(records) {
+  const days = new Map();
+  for (const r of records) {
+    const day = (r.started_at || '').slice(0, 10);
+    if (!day) continue;
+    let d = days.get(day);
+    if (!d) { d = {day, sessions: 0, live: 0, runtime: 0, down: 0, up: 0}; days.set(day, d); }
+    d.sessions++;
+    if (r.live) d.live++;
+    d.runtime += r.runtime_seconds || 0;
+    d.down += r.downloaded_bytes || 0;
+    d.up += r.uploaded_bytes || 0;
+  }
+  return [...days.values()].sort((a, b) => a.day.localeCompare(b.day));
+}
+
+function fmtDayLabel(day) { const [Y, M, D] = day.split('-'); return MONTHS[+M - 1] + ' ' + (+D); }
+function fmtDayTitle(day) { return fmtDayLabel(day) + ', ' + day.slice(0, 4); }
+
+// Rows for the current view: one per merged day, or one per session when
+// drilled into histDrill. Each row carries its own label/tooltip text.
+function viewRows() {
+  if (!histDrill) {
+    return histDays.map(d => Object.assign({
+      label: fmtDayLabel(d.day),
+      title: fmtDayTitle(d.day),
+      meta: d.sessions + ' session' + (d.sessions > 1 ? 's' : '')
+        + (d.live ? ' (' + d.live + ' running)' : '') + ' · ' + fmtDays(d.runtime),
+    }, d));
+  }
+  return allRecords()
+    .filter(r => (r.started_at || '').slice(0, 10) === histDrill)
+    .sort((a, b) => (a.started_at || '').localeCompare(b.started_at || ''))
+    .map(r => ({
+      sessions: 1, live: r.live ? 1 : 0,
+      runtime: r.runtime_seconds || 0,
+      down: r.downloaded_bytes || 0, up: r.uploaded_bytes || 0,
+      label: (r.started_at || '').slice(11, 16) || '—',
+      title: fmtDayTitle(histDrill) + ' ' + (r.started_at || '').slice(11, 16),
+      meta: 'Runtime ' + fmtDays(r.runtime_seconds || 0) + (r.live ? ' · running' : ''),
+    }));
+}
+
+function applyHistMode() {
+  for (const b of document.querySelectorAll('#histseg button')) {
+    b.classList.toggle('on', b.dataset.mode === histMode);
+  }
+  try { localStorage.setItem('histMode', histMode); } catch (e) {}
+  drawHistory();
+}
+document.getElementById('histseg').addEventListener('click', e => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  histMode = b.dataset.mode;
+  applyHistMode();
+});
+
+// Per-day series values: totals in bytes, or bytes/runtime in avg mode
+// (0 when the day logged no active time).
+function dayVals(d) {
+  const vol = histMode === 'vol';
+  return [vol ? d.down : (d.runtime ? d.down / d.runtime : 0),
+          vol ? d.up : (d.runtime ? d.up / d.runtime : 0)];
+}
+
+function drawHistory() {
+  histRows = viewRows();
+  histBack.hidden = !histDrill;
+  const t = {sessions: 0, live: 0, runtime: 0, down: 0, up: 0};
+  for (const r of histRows) {
+    t.sessions += r.sessions; t.live += r.live;
+    t.runtime += r.runtime; t.down += r.down; t.up += r.up;
+  }
+  const sum = document.getElementById('histsum');
+  const ctx = histCanvas.getContext('2d');
+  histCanvas.width = Math.round(histCanvas.clientWidth * DPR);
+  histCanvas.height = Math.round(histCanvas.clientHeight * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const W = histCanvas.clientWidth, H = histCanvas.clientHeight;
+  ctx.clearRect(0, 0, W, H);
+  if (!t.sessions) {
+    sum.textContent = histDrill
+      ? 'No sessions recorded on this day.'
+      : 'No session history yet — a line is appended to history.jsonl each time Transmission exits.';
+    ctx.font = '13px system-ui'; ctx.textAlign = 'center'; ctx.fillStyle = '#8b949e';
+    ctx.fillText('Nothing to show yet', W / 2, H / 2);
+    return;
+  }
+  const live = t.live ? ' (incl. the current session)' : '';
+  const head = histDrill
+    ? `<b>${fmtDayTitle(histDrill)}</b>`
+    : `<b>${histDays.length}</b> day${histDays.length > 1 ? 's' : ''}`;
+  sum.innerHTML = `${head} · <b>${t.sessions}</b> session${t.sessions > 1 ? 's' : ''}${live} · <b>${fmtDays(t.runtime)}</b>`
+    + (histMode === 'vol'
+      ? ` · ↓ <b class="dn">${fmtBytes(t.down)}</b> · ↑ <b class="up">${fmtBytes(t.up)}</b>`
+      : ` · avg ↓ <b class="dn">${fmtBytes(t.runtime ? t.down / t.runtime : 0)}/s</b> · ↑ <b class="up">${fmtBytes(t.runtime ? t.up / t.runtime : 0)}/s</b>`);
+
+  const left = 44, top = 10, bottom = 22, pad = 6;
+  const plotW = W - left - pad, plotH = H - top - bottom;
+  const n = histRows.length, slot = plotW / n;
+  const bw = Math.min(17, Math.max(2, slot * 0.34));
+  const vmax = Math.max(1, ...histRows.map(r => Math.max(...dayVals(r)))) * 1.1;
+  const y = v => top + plotH * (1 - v / vmax);
+  const cx = i => left + slot * (i + 0.5);
+
+  const step = niceStep(vmax / 4);
+  ctx.font = '10px system-ui';
+  ctx.strokeStyle = '#21262d';
+  ctx.fillStyle = '#8b949e';
+  ctx.textAlign = 'right';
+  for (let v = step; v < vmax; v += step) {
+    const yy = y(v);
+    ctx.beginPath(); ctx.moveTo(left, yy); ctx.lineTo(W - pad, yy); ctx.stroke();
+    ctx.fillText(fmtShort(v) + (histMode === 'avg' ? '/s' : ''), left - 5, yy + 3);
+  }
+
+  // side-by-side bars: download left (blue), upload right (green)
+  histRows.forEach((r, i) => {
+    const [dv, uv] = dayVals(r);
+    ctx.fillStyle = '#5aa9e6';
+    ctx.fillRect(cx(i) - bw - 1, y(dv), bw, y(0) - y(dv));
+    ctx.fillStyle = '#7ee2a8';
+    ctx.fillRect(cx(i) + 1, y(uv), bw, y(0) - y(uv));
+  });
+
+  const every = Math.ceil(n / 12);
+  ctx.textAlign = 'center';
+  histRows.forEach((r, i) => {
+    if (i % every) return;
+    const half = ctx.measureText(r.label).width / 2;
+    ctx.fillText(r.label, Math.min(Math.max(cx(i), pad + half), W - pad - half), H - 8);
+  });
+}
+
+function histHitIndex(mx) {
+  const n = histRows.length, left = 44, pad = 6;
+  if (!n) return -1;
+  const i = Math.floor((mx - left) / ((histCanvas.clientWidth - left - pad) / n));
+  return i >= 0 && i < n ? i : -1;
+}
+
+histCanvas.addEventListener('mousemove', e => {
+  const rect = histCanvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const i = histHitIndex(mx);
+  histCanvas.style.cursor = (!histDrill && i >= 0) ? 'pointer' : '';
+  if (i < 0) { histTip.style.display = 'none'; return; }
+  const r = histRows[i];
+  const [dv, uv] = dayVals(r), sfx = histMode === 'vol' ? '' : '/s';
+  histTip.textContent = r.title + '\n' + r.meta
+    + '\n↓ ' + fmtBytes(dv) + sfx + '  ↑ ' + fmtBytes(uv) + sfx;
+  histTip.style.display = 'block';
+  histTip.style.left = Math.max(4, Math.min(mx + 12, histCanvas.clientWidth - histTip.offsetWidth - 4)) + 'px';
+  histTip.style.top = Math.max(4, e.clientY - rect.top - histTip.offsetHeight - 10) + 'px';
+});
+histCanvas.addEventListener('mouseleave', () => { histTip.style.display = 'none'; });
+histCanvas.addEventListener('click', e => {
+  if (histDrill) return;
+  const i = histHitIndex(e.clientX - histCanvas.getBoundingClientRect().left);
+  if (i >= 0) {
+    histDrill = histRows[i].day;
+    histTip.style.display = 'none';
+    drawHistory();
+  }
+});
+histBack.addEventListener('click', () => { histDrill = null; drawHistory(); });
+
+document.getElementById('histbtn').addEventListener('click', () => {
+  histDays = histData();
+  histModal.classList.add('open');
+  applyHistMode();
+});
+const closeHist = () => { histDrill = null; histModal.classList.remove('open'); };
+document.getElementById('histclose').addEventListener('click', closeHist);
+histModal.addEventListener('mousedown', e => { if (e.target === histModal) closeHist(); });
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (histModal.classList.contains('open') && histDrill) { histDrill = null; drawHistory(); }
+  else closeHist();
+});
+window.addEventListener('resize', () => { if (histModal.classList.contains('open')) drawHistory(); });
+
 const statusEl = document.getElementById('status');
 function rpcError(err) {
   statusEl.textContent = 'Transmission RPC unavailable: ' + err;
@@ -885,6 +1154,11 @@ function rpcError(err) {
 // session-stats payload, pushed once a second
 function onStats(s) {
   if (s.error) { rpcError(s.error); return; }
+  lastStats = s;
+  if (histModal.classList.contains('open')) {
+    histDays = histData();
+    drawHistory();
+  }
   const c = s['current-stats'] || {};
   const cum = s['cumulative-stats'] || {};
   const V = id => document.getElementById(id);
@@ -1001,6 +1275,15 @@ evs.addEventListener('history', e => {
   speedPeak.d = h.peak_d || 0;
   speedPeak.u = h.peak_u || 0;
   drawSpeedChart();
+});
+evs.addEventListener('sessions', e => {
+  // history.jsonl snapshot, pushed once on subscribe — the file only grows
+  // at exit. Refresh the modal if it happens to be open.
+  histRecords = JSON.parse(e.data);
+  if (histModal.classList.contains('open')) {
+    histDays = histData();
+    drawHistory();
+  }
 });
 evs.addEventListener('speed', e => {
   clearGone();

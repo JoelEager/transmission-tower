@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -147,6 +148,9 @@ pub struct Hub {
     /// Latest `session-stats` arguments — also read at shutdown to log
     /// session totals.
     pub session: Option<Value>,
+    /// Parsed contents of `history.jsonl`, loaded once at startup — the
+    /// file only grows when the process exits.
+    sessions: Value,
     torrents: Option<Value>,
     port: Option<Value>,
     speed: SpeedHistory,
@@ -167,6 +171,7 @@ impl Hub {
     /// The speed history goes first so its baseline precedes live updates.
     fn replay(&self, stream: &mut TcpStream) -> io::Result<()> {
         stream.write_all(sse_frame("history", &self.speed.to_json()).as_bytes())?;
+        stream.write_all(sse_frame("sessions", &self.sessions).as_bytes())?;
         for (event, value) in [
             ("status", &self.session),
             ("torrents", &self.torrents),
@@ -295,6 +300,7 @@ pub fn spawn(
     port: u16,
     client: Arc<RpcClient>,
     hub: Arc<Mutex<Hub>>,
+    history_path: &Path,
     logger: &Logger,
 ) -> Option<String> {
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
@@ -307,6 +313,8 @@ pub fn spawn(
             return None;
         }
     };
+
+    hub.lock().unwrap().sessions = read_history(history_path);
 
     let hostname = detect_hostname();
     let accept_hub = Arc::clone(&hub);
@@ -417,6 +425,23 @@ fn handle_conn(mut stream: TcpStream, hub: &Mutex<Hub>, hostname: &str) {
             }
         }
     }
+}
+
+/// Reads `history.jsonl` into a JSON array. A missing/unreadable file and
+/// malformed lines are treated as empty — history is best-effort. The
+/// running session isn't in the file (it's appended at exit); the page
+/// merges it in from its session-stats stream instead so the history
+/// modal can update live.
+fn read_history(path: &Path) -> Value {
+    std::fs::read_to_string(path)
+        .map(|text| {
+            Value::Array(
+                text.lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect(),
+            )
+        })
+        .unwrap_or_else(|_| Value::Array(Vec::new()))
 }
 
 /// Upgrades the connection to an SSE stream and hands it to the hub.
@@ -666,6 +691,10 @@ mod tests {
     }
 
     fn spawn_dashboard() -> (u16, Arc<Mutex<Hub>>) {
+        spawn_dashboard_on(Path::new("nonexistent-history.jsonl"))
+    }
+
+    fn spawn_dashboard_on(history_path: &Path) -> (u16, Arc<Mutex<Hub>>) {
         let dir = tempfile::tempdir().unwrap();
         let logger = Logger::new(dir.path().join("log.txt"), false);
         let client = Arc::new(RpcClient::new(mock_rpc_server(), None, None));
@@ -674,7 +703,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let dash_port = listener.local_addr().unwrap().port();
         drop(listener);
-        spawn(dash_port, client, hub.clone(), &logger).unwrap();
+        spawn(dash_port, client, hub.clone(), history_path, &logger).unwrap();
         (dash_port, hub)
     }
 
@@ -740,6 +769,48 @@ mod tests {
         assert!(resp.contains("<svg"));
     }
 
+    #[test]
+    fn test_dashboard_pushes_session_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let hist = dir.path().join("history.jsonl");
+        std::fs::write(
+            &hist,
+            "{\"started_at\":\"2026-11-01 10:00:00\",\"downloaded_bytes\":5}\nnot json\n",
+        )
+        .unwrap();
+        let (dash_port, _hub) = spawn_dashboard_on(&hist);
+
+        // The file's records ride out on the event stream's initial replay.
+        let mut stream = TcpStream::connect(("127.0.0.1", dash_port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .write_all(b"GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !String::from_utf8_lossy(&buf).contains("event: sessions") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for sessions frame; got: {}",
+                String::from_utf8_lossy(&buf)
+            );
+            let n = stream.read(&mut chunk).unwrap();
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let text = String::from_utf8_lossy(&buf).to_string();
+        assert!(text.contains("\"downloaded_bytes\":5"), "{}", text);
+        assert!(!text.contains("not json"), "{}", text);
+
+        // A missing history file is an empty array, not an error.
+        assert_eq!(
+            read_history(Path::new("nonexistent-history.jsonl")),
+            json!([])
+        );
+    }
+
     /// Subscribing to /events yields an SSE stream that carries the
     /// poller's first-tick broadcasts (status + torrents + the one-time
     /// port event) plus anything broadcast through the hub later.
@@ -800,6 +871,7 @@ mod tests {
 
         let hub = Hub {
             session: Some(json!({"a": 1})),
+            sessions: json!([{"s": 3}]),
             torrents: None,
             port: Some(json!({"p": 2})),
             speed: SpeedHistory::default(),
@@ -811,6 +883,7 @@ mod tests {
         let mut buf = String::new();
         reader.read_to_string(&mut buf).unwrap();
         assert!(buf.contains("event: history"), "{}", buf);
+        assert!(buf.contains("event: sessions\ndata: [{\"s\":3}]"), "{}", buf);
         assert!(buf.contains("event: status\ndata: {\"a\":1}"), "{}", buf);
         assert!(buf.contains("event: port\ndata: {\"p\":2}"), "{}", buf);
         assert!(!buf.contains("event: torrents"), "{}", buf);
