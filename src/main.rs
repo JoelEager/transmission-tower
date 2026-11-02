@@ -228,7 +228,6 @@ fn clear_clipboard(logger: &Logger) {
                 // If clear fails, try setting empty text as fallback
                 let _ = clipboard.set_text("");
             }
-            logger.log("Clipboard reset to empty.");
         }
         Err(e) => {
             logger.log(&format!("Failed to access clipboard to reset: {}", e));
@@ -243,28 +242,26 @@ fn poll_port_from_clipboard_with_interval(
 ) -> Result<u16, String> {
     logger.log("Copy VPN forwarding port to continue...");
 
-    for attempt in 1..=total_attempts {
+    let mut last_err = String::new();
+    for _ in 0..total_attempts {
         std::thread::sleep(sleep_duration);
-
         match get_port_from_clipboard() {
             Ok(port) => {
-                logger.log(&format!(
-                    "Attempt {}/{}: Found valid port {} on clipboard",
-                    attempt, total_attempts, port
-                ));
                 clear_clipboard(logger);
                 return Ok(port);
             }
-            Err(err_msg) => {
-                logger.log(&format!(
-                    "Attempt {}/{}: {}",
-                    attempt, total_attempts, err_msg
-                ));
-            }
+            Err(err_msg) => last_err = err_msg,
         }
     }
 
-    let failure_msg = "Failed to find a valid port on clipboard after 30 seconds.".to_string();
+    let failure_msg = if last_err.is_empty() {
+        "Failed to find a valid port on clipboard after 30 seconds.".to_string()
+    } else {
+        format!(
+            "Failed to find a valid port on clipboard after 30 seconds: {}",
+            last_err
+        )
+    };
     logger.log(&failure_msg);
     Err(failure_msg)
 }
@@ -828,15 +825,17 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
-            "Failed to find a valid port on clipboard after 30 seconds."
+            "Failed to find a valid port on clipboard after 30 seconds: Clipboard content is not a valid port number"
         );
 
         let log_content = fs::read_to_string(&log_file).unwrap();
-        assert!(log_content.contains("Attempt 1/2:"));
-        assert!(log_content.contains("Attempt 2/2:"));
-        assert!(log_content.contains("Failed to find a valid port on clipboard after 30 seconds."));
-        // The non-port clipboard value itself must not leak into the log.
+        assert!(log_content.contains("Copy VPN forwarding port to continue"));
+        assert!(log_content.contains("Failed to find a valid port on clipboard after 30 seconds"));
+        // The failure line carries the reason but not the clipboard value.
+        assert!(log_content.contains("Clipboard content is not a valid port number"));
         assert!(!log_content.contains("not_a_port"));
+        // Polling attempts are no longer logged one per line.
+        assert!(!log_content.contains("Attempt"));
     }
 
     #[test]
@@ -854,10 +853,6 @@ mod tests {
                 std::time::Duration::from_millis(10),
             );
             assert_eq!(result.unwrap(), 54321);
-
-            let log_content = fs::read_to_string(&log_file).unwrap();
-            assert!(log_content.contains("Found valid port 54321 on clipboard"));
-            assert!(log_content.contains("Clipboard reset to empty."));
 
             // Verify clipboard was reset
             let current_cb_text = cb.get_text().unwrap_or_default();
