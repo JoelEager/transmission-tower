@@ -552,6 +552,19 @@ function sizeCanvases() {
   drawSpeedChart();
 }
 window.addEventListener('resize', sizeCanvases);
+// Restore the saved split positions, re-clamped to the current window.
+try {
+  const w = parseInt(localStorage.getItem('panelWidth'), 10);
+  if (w) {
+    document.getElementById('right').style.width =
+      Math.min(Math.max(220, w), window.innerWidth * 0.8) + 'px';
+  }
+  const h = parseInt(localStorage.getItem('chartHeight'), 10);
+  if (h) {
+    document.getElementById('speedchart').style.height =
+      Math.min(Math.max(50, h), window.innerHeight * 0.7) + 'px';
+  }
+} catch (e) {}
 sizeCanvases();
 
 // Torrent cards and peer rows are keyed so refreshes update in place
@@ -834,6 +847,7 @@ document.getElementById('hdivider').addEventListener('mousedown', e => {
   };
   const up = () => {
     hdiv.classList.remove('drag');
+    try { localStorage.setItem('chartHeight', chart.style.height); } catch (e) {}
     document.removeEventListener('mousemove', move);
     document.removeEventListener('mouseup', up);
   };
@@ -853,6 +867,9 @@ document.getElementById('divider').addEventListener('mousedown', e => {
   };
   const up = () => {
     divider.classList.remove('drag');
+    try {
+      localStorage.setItem('panelWidth', right.style.width);
+    } catch (e) {}
     document.removeEventListener('mousemove', move);
     document.removeEventListener('mouseup', up);
   };
