@@ -151,6 +151,11 @@ pub struct Hub {
     /// Parsed contents of `history.jsonl`, loaded once at startup — the
     /// file only grows when the process exits.
     sessions: Value,
+    /// Detected machine hostname, sent in the `meta` replay frame.
+    hostname: String,
+    /// Wall-clock time Transmission was launched, set by the caller before
+    /// spawn — sent in the `meta` replay frame.
+    pub started_at: Option<String>,
     torrents: Option<Value>,
     port: Option<Value>,
     speed: SpeedHistory,
@@ -172,6 +177,11 @@ impl Hub {
     fn replay(&self, stream: &mut TcpStream) -> io::Result<()> {
         stream.write_all(sse_frame("history", &self.speed.to_json()).as_bytes())?;
         stream.write_all(sse_frame("sessions", &self.sessions).as_bytes())?;
+        let meta = json!({
+            "hostname": self.hostname,
+            "started_at": self.started_at,
+        });
+        stream.write_all(sse_frame("meta", &meta).as_bytes())?;
         for (event, value) in [
             ("status", &self.session),
             ("torrents", &self.torrents),
@@ -314,17 +324,19 @@ pub fn spawn(
         }
     };
 
-    hub.lock().unwrap().sessions = read_history(history_path);
+    {
+        let mut h = hub.lock().unwrap();
+        h.hostname = detect_hostname();
+        h.sessions = read_history(history_path);
+    }
 
-    let hostname = detect_hostname();
     let accept_hub = Arc::clone(&hub);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
                     let hub = Arc::clone(&accept_hub);
-                    let hostname = hostname.clone();
-                    std::thread::spawn(move || handle_conn(stream, &hub, &hostname));
+                    std::thread::spawn(move || handle_conn(stream, &hub));
                 }
                 // Transient accept errors (e.g. fd exhaustion) would
                 // otherwise spin the accept loop.
@@ -364,7 +376,7 @@ fn detect_hostname() -> String {
         .unwrap_or_else(|| "localhost".to_string())
 }
 
-fn handle_conn(mut stream: TcpStream, hub: &Mutex<Hub>, hostname: &str) {
+fn handle_conn(mut stream: TcpStream, hub: &Mutex<Hub>) {
     // Idle keep-alive connections are dropped after this. SSE streams are
     // unaffected — they leave this function as soon as they're registered.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(75)));
@@ -397,7 +409,7 @@ fn handle_conn(mut stream: TcpStream, hub: &Mutex<Hub>, hostname: &str) {
                     &mut stream,
                     200,
                     "text/html; charset=utf-8",
-                    &INDEX_HTML.replace("[hostname]", hostname),
+                    INDEX_HTML,
                     keep_alive,
                 ) {
                     return;
@@ -756,7 +768,8 @@ mod tests {
         let resp = get(dash_port, "/");
         assert!(resp.contains("200 OK"));
         assert!(resp.contains("<title>Transmission Tower</title>"));
-        assert!(!resp.contains("[hostname]"));
+        // The page is served verbatim — nothing is injected into the HTML.
+        assert!(resp.ends_with(INDEX_HTML));
     }
 
     #[test]
@@ -872,6 +885,8 @@ mod tests {
         let hub = Hub {
             session: Some(json!({"a": 1})),
             sessions: json!([{"s": 3}]),
+            hostname: "testhost".to_string(),
+            started_at: Some("2026-11-01 09:00:00".to_string()),
             torrents: None,
             port: Some(json!({"p": 2})),
             speed: SpeedHistory::default(),
@@ -884,6 +899,9 @@ mod tests {
         reader.read_to_string(&mut buf).unwrap();
         assert!(buf.contains("event: history"), "{}", buf);
         assert!(buf.contains("event: sessions\ndata: [{\"s\":3}]"), "{}", buf);
+        assert!(buf.contains("event: meta"), "{}", buf);
+        assert!(buf.contains("\"hostname\":\"testhost\""), "{}", buf);
+        assert!(buf.contains("\"started_at\":\"2026-11-01 09:00:00\""), "{}", buf);
         assert!(buf.contains("event: status\ndata: {\"a\":1}"), "{}", buf);
         assert!(buf.contains("event: port\ndata: {\"p\":2}"), "{}", buf);
         assert!(!buf.contains("event: torrents"), "{}", buf);

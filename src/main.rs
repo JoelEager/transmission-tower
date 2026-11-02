@@ -375,6 +375,7 @@ fn run_app_logic(
     ));
 
     let hub: Arc<Mutex<dashboard::Hub>> = Arc::new(Mutex::new(dashboard::Hub::default()));
+    hub.lock().unwrap().started_at = Some(started_at.format("%Y-%m-%d %H:%M:%S").to_string());
     if dashboard_enabled {
         let client = Arc::new(rpc::RpcClient::new(
             rpc_port,

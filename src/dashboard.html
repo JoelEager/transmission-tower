@@ -445,7 +445,7 @@ function tick() {
   ctx.fillStyle = '#8b949e';
   ctx.font = '11px system-ui';
   ctx.textAlign = 'center';
-  ctx.fillText('[hostname]', CX, CY + 22);
+  ctx.fillText((sessionMeta && sessionMeta.hostname) || '', CX, CY + 22);
 
   // current session speeds, top-right corner
   const upTxt = '↑ ' + fmtBytes(latestSpeeds.u) + '/s';
@@ -918,7 +918,7 @@ document.getElementById('divider').addEventListener('mousedown', e => {
 const histModal = document.getElementById('histmodal');
 const histTip = document.getElementById('histtip');
 const histCanvas = document.getElementById('histchart');
-let histRecords = [], histDays = [], histRows = [], lastStats = null;
+let histRecords = [], histDays = [], histRows = [], lastStats = null, sessionMeta = null;
 let histDrill = null;   // "YYYY-MM-DD" while viewing one day's sessions
 const histBack = document.getElementById('histback');
 let histMode = 'vol';
@@ -944,7 +944,10 @@ function liveRecord() {
   const c = lastStats && lastStats['current-stats'];
   if (!c || c.secondsActive == null) return null;
   return {
-    started_at: localStamp(new Date(Date.now() - c.secondsActive * 1000)),
+    // Exact launch time rides in on the meta frame; fall back to deriving
+    // it from secondsActive if it hasn't arrived yet.
+    started_at: (sessionMeta && sessionMeta.started_at)
+      || localStamp(new Date(Date.now() - c.secondsActive * 1000)),
     runtime_seconds: c.secondsActive,
     downloaded_bytes: c.downloadedBytes || 0,
     uploaded_bytes: c.uploadedBytes || 0,
@@ -1275,6 +1278,10 @@ evs.addEventListener('history', e => {
   speedPeak.d = h.peak_d || 0;
   speedPeak.u = h.peak_u || 0;
   drawSpeedChart();
+});
+evs.addEventListener('meta', e => {
+  // Static values sent once on subscribe: the session launch time.
+  sessionMeta = JSON.parse(e.data);
 });
 evs.addEventListener('sessions', e => {
   // history.jsonl snapshot, pushed once on subscribe — the file only grows
