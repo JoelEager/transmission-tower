@@ -1122,7 +1122,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "transmission-proton"
+name = "transmission-tower"
 version = "1.0.0"
 dependencies = [
  "arboard",

@@ -26,8 +26,10 @@ Note that `rpc-enabled` persists in `settings.json`, so Transmission's localhost
 
 Disable the whole feature with `--no-dashboard`; change the dashboard port with `--dashboard-port`.
 
-# Transmission Proton Helper
-Simple tool to update [Transmission](https://github.com/transmission/transmission)'s peer port with a value from the clipboard and launch Transmission. Intended to configure and launch Transmission via Proton VPN using the "Connect and Go" profile option. Includes a log file for troubleshooting and history.
+# Transmission Tower
+Session companion for [Transmission](https://github.com/transmission/transmission): applies the VPN forwarded port to `settings.json`, enables a localhost-only RPC server, launches the client, and serves a live dashboard (see below) while it runs. Session totals are appended to a log file for troubleshooting and history.
+
+Designed to run from a VPN's "launch an app after connecting" hook (e.g. Proton VPN's "Connect and Go" profile) — copy the forwarded port to the clipboard and it takes care of the rest. The port can also be passed directly with `--port`.
 
 Mostly vibe coded using [Google Jules](https://jules.google.com/).
 
@@ -40,13 +42,13 @@ Mostly vibe coded using [Google Jules](https://jules.google.com/).
 cargo build --release
 ```
 
-The compiled executable will be available at `target/release/transmission-proton` (or `transmission-proton.exe` on Windows).
+The compiled executable will be available at `target/release/transmission-tower` (or `transmission-tower.exe` on Windows).
 
 ## Usage
 Simply run the binary:
 
 ```bash
-./target/release/transmission-proton
+./target/release/transmission-tower
 ```
 
 It should automatically detect the Transmission configuration path and executable for your platform. If not, the defaults can be overridden with command line options. After launching the binary just copy the port number and it should take care of the rest. (Run with `--help` for usage.)

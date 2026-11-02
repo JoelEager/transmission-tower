@@ -19,7 +19,7 @@ use serde_json::Value;
 #[command(
     author,
     version,
-    about = "Updates Transmission peer-port from clipboard and launches Transmission."
+    about = "Transmission session companion: applies the forwarded port, launches the client, and serves a live dashboard."
 )]
 pub struct Args {
     /// Directory containing the `transmission/settings.json` file.
@@ -32,7 +32,7 @@ pub struct Args {
     #[arg(long)]
     pub transmission_path: Option<PathBuf>,
 
-    /// Path to the log file. Defaults to `~/.transmission-proton.log`.
+    /// Path to the log file. Defaults to `~/.transmission-tower.log`.
     #[arg(long)]
     pub log_file: Option<PathBuf>,
 
@@ -95,7 +95,7 @@ impl Logger {
 
 fn default_log_file() -> Result<PathBuf, String> {
     dirs::home_dir()
-        .map(|home| home.join(".transmission-proton.log"))
+        .map(|home| home.join(".transmission-tower.log"))
         .ok_or_else(|| "Could not determine user home directory".to_string())
 }
 
@@ -423,7 +423,7 @@ fn run_app(args: Args) -> Result<(), String> {
     };
 
     let logger = Logger::new(log_file, args.verbose);
-    logger.writeln_file("=== transmission-proton invoked ===");
+    logger.writeln_file("=== transmission-tower invoked ===");
 
     if let Err(err) = run_app_logic(&args, &logger) {
         logger.log(&format!("ERROR: {}", err));
@@ -530,7 +530,7 @@ mod tests {
     #[test]
     fn test_default_log_file() {
         let home = dirs::home_dir().expect("Home dir should be present in test env");
-        let expected = home.join(".transmission-proton.log");
+        let expected = home.join(".transmission-tower.log");
         assert_eq!(default_log_file().unwrap(), expected);
     }
 
@@ -679,13 +679,13 @@ mod tests {
 
     #[test]
     fn test_args_verbose_flag_parsing() {
-        let args_short = Args::parse_from(["transmission-proton", "-v"]);
+        let args_short = Args::parse_from(["transmission-tower", "-v"]);
         assert!(args_short.verbose);
 
-        let args_long = Args::parse_from(["transmission-proton", "--verbose"]);
+        let args_long = Args::parse_from(["transmission-tower", "--verbose"]);
         assert!(args_long.verbose);
 
-        let args_default = Args::parse_from(["transmission-proton"]);
+        let args_default = Args::parse_from(["transmission-tower"]);
         assert!(!args_default.verbose);
     }
 

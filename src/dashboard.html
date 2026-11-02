@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20100%20100%22%3E%3Cg%20fill%3D%22%23d0342c%22%3E%3Crect%20x%3D%2242%22%20y%3D%220%22%20width%3D%2216%22%20height%3D%2224%22%20rx%3D%223%22%20transform%3D%22rotate%280%2050%2050%29%22%2F%3E%3Crect%20x%3D%2242%22%20y%3D%220%22%20width%3D%2216%22%20height%3D%2224%22%20rx%3D%223%22%20transform%3D%22rotate%2845%2050%2050%29%22%2F%3E%3Crect%20x%3D%2242%22%20y%3D%220%22%20width%3D%2216%22%20height%3D%2224%22%20rx%3D%223%22%20transform%3D%22rotate%2890%2050%2050%29%22%2F%3E%3Crect%20x%3D%2242%22%20y%3D%220%22%20width%3D%2216%22%20height%3D%2224%22%20rx%3D%223%22%20transform%3D%22rotate%28135%2050%2050%29%22%2F%3E%3Crect%20x%3D%2242%22%20y%3D%220%22%20width%3D%2216%22%20height%3D%2224%22%20rx%3D%223%22%20transform%3D%22rotate%28180%2050%2050%29%22%2F%3E%3Crect%20x%3D%2242%22%20y%3D%220%22%20width%3D%2216%22%20height%3D%2224%22%20rx%3D%223%22%20transform%3D%22rotate%28225%2050%2050%29%22%2F%3E%3Crect%20x%3D%2242%22%20y%3D%220%22%20width%3D%2216%22%20height%3D%2224%22%20rx%3D%223%22%20transform%3D%22rotate%28270%2050%2050%29%22%2F%3E%3Crect%20x%3D%2242%22%20y%3D%220%22%20width%3D%2216%22%20height%3D%2224%22%20rx%3D%223%22%20transform%3D%22rotate%28315%2050%2050%29%22%2F%3E%3Cpath%20d%3D%22M50%2017a33%2033%200%201%200%20.01%200zM50%2037a13%2013%200%201%200-.01%200z%22%20fill-rule%3D%22evenodd%22%2F%3E%3C%2Fg%3E%3C%2Fsvg%3E">
-<title>Transmission visualization</title>
+<title>Transmission Tower</title>
 <style>
   :root { color-scheme: dark; }
   ::-webkit-scrollbar { width:10px; }
@@ -127,7 +127,7 @@ async function rpc(method, args) {
     });
   } catch (e) {
     // The fetch itself failed — either the embedded server is gone (the
-    // transmission-proton process exited) or the socket layer hiccuped;
+    // transmission-tower process exited) or the socket layer hiccuped;
     // refresh() tells them apart after a few consecutive failures.
     e.dashboardGone = true;
     throw e;
@@ -902,7 +902,7 @@ async function refresh() {
         status.textContent = 'Dashboard connection failed — retrying…';
         return;
       }
-      status.textContent = 'transmission-proton has exited; this dashboard is no longer updating. '
+      status.textContent = 'transmission-tower has exited; this dashboard is no longer updating. '
         + 'Session totals were written to the log file.';
       document.title = 'Transmission offline';
       clearInterval(refreshTimer);
