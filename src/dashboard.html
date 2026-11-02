@@ -25,6 +25,21 @@
   #right * { overflow-anchor:none; }
   canvas { display:block; width:100%; background:#0d0f12; border:1px solid #262c33; border-radius:6px; }
   #speedchart { height:110px; flex-shrink:0; }
+  #hdivider { height:5px; flex-shrink:0; cursor:row-resize; border-radius:3px; }
+  #hdivider:hover, #hdivider.drag { background:#30363d; }
+  #speedbar { display:flex; align-items:center; gap:1rem; margin-bottom:.4rem; flex-shrink:0; }
+  #brand { display:flex; align-items:center; gap:.4rem; font-weight:600; font-size:13px; white-space:nowrap; }
+  #speedstats { flex:1; text-align:right; font-size:12px; white-space:nowrap; overflow:hidden; }
+  #speedstats .slabel { color:#8b949e; margin-left:1rem; }
+  #speedstats .dn { color:#5aa9e6; }
+  #speedstats .up { color:#7ee2a8; }
+  #rangeseg { display:flex; border:1px solid #30363d; border-radius:5px;
+              overflow:hidden; background:#1c2127; flex-shrink:0; }
+  #rangeseg button { background:transparent; color:#8b949e; border:none;
+                     font-size:12px; padding:.2rem .8rem; cursor:pointer; }
+  #rangeseg button:hover { color:#d8dee4; }
+  #rangeseg button.on { background:#3a424d; color:#e6edf3; font-weight:600; }
+  #rangeseg button + button { border-left:1px solid #30363d; }
   #swarmwrap { position:relative; flex:1; min-height:0; }
   #swarm { height:100%; }
   #tip { position:absolute; display:none; background:#1c2127; border:1px solid #444; border-radius:4px;
@@ -64,7 +79,15 @@
 </head>
 <body>
 <div id="left">
+<div id="speedbar">
+<div id="brand"><svg width="16" height="16" viewBox="0 0 100 100"><g fill="#d0342c"><rect x="42" y="0" width="16" height="24" rx="3" transform="rotate(0 50 50)"/><rect x="42" y="0" width="16" height="24" rx="3" transform="rotate(45 50 50)"/><rect x="42" y="0" width="16" height="24" rx="3" transform="rotate(90 50 50)"/><rect x="42" y="0" width="16" height="24" rx="3" transform="rotate(135 50 50)"/><rect x="42" y="0" width="16" height="24" rx="3" transform="rotate(180 50 50)"/><rect x="42" y="0" width="16" height="24" rx="3" transform="rotate(225 50 50)"/><rect x="42" y="0" width="16" height="24" rx="3" transform="rotate(270 50 50)"/><rect x="42" y="0" width="16" height="24" rx="3" transform="rotate(315 50 50)"/><path d="M50 17a33 33 0 1 0 .01 0zM50 37a13 13 0 1 0-.01 0z" fill-rule="evenodd"/></g></svg>Transmission Tower</div>
+<div id="speedstats"><span class="slabel">Peak</span> <span class="dn" id="ss-peak-d"></span> <span class="up" id="ss-peak-u"></span><span class="slabel">Avg</span> <span class="dn" id="ss-avg-d"></span> <span class="up" id="ss-avg-u"></span></div>
+<div id="rangeseg">
+<button data-range="win" title="Show the last 10 minutes">10m</button><button data-range="all" title="Show the whole session">All</button>
+</div>
+</div>
 <canvas id="speedchart"></canvas>
+<div id="hdivider"></div>
 <div id="swarmwrap">
 <canvas id="swarm"></canvas>
 <div id="tip"></div>
@@ -152,17 +175,29 @@ function renderPorts() {
   V('v-ipv6').className = 'v' + (portStatus.ipv6 === 'open' ? ' ok' : '');
 }
 
-// ---- Speed history (kept in-page only, starts when the page opens) ----
-const speedHist = []; // one {d, u} sample per status event (every second)
-const SPEED_HIST_MAX = 600; // ~10 minutes at 1s ticks
-const speedPeak = {d: 0, u: 0}; // session max — survives samples aging out of the window
-function pushSpeed(d, u) {
-  speedHist.push({d, u});
-  if (speedHist.length > SPEED_HIST_MAX) speedHist.shift();
-  speedPeak.d = Math.max(speedPeak.d, d);
-  speedPeak.u = Math.max(speedPeak.u, u);
+// ---- Speed history (fed by the server: per-second 'speed' events plus a
+// whole-session 'history' snapshot on subscribe, decimated server-side) ----
+let speedHist = []; // [t_secs_since_session_start, down_B/s, up_B/s]
+const speedPeak = {d: 0, u: 0}; // session max reported by the server
+const sessionAvg = {d: 0, u: 0}; // whole-session mean: bytes / secondsActive
+const SPEED_WINDOW_S = 600;   // the short "last 10 minutes" range
+let speedFullRange = false;
+try { speedFullRange = localStorage.getItem('speedRange') === 'all'; } catch (e) {}
+
+const rangeSeg = document.getElementById('rangeseg');
+function applySpeedRange() {
+  for (const b of rangeSeg.querySelectorAll('button')) {
+    b.classList.toggle('on', (b.dataset.range === 'all') === speedFullRange);
+  }
+  try { localStorage.setItem('speedRange', speedFullRange ? 'all' : 'win'); } catch (e) {}
   drawSpeedChart();
 }
+rangeSeg.addEventListener('click', e => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  speedFullRange = b.dataset.range === 'all';
+  applySpeedRange();
+});
 
 // Smallest 1/2/5-style value >= target, for readable gridline spacing.
 function niceStep(target) {
@@ -174,18 +209,42 @@ function niceStep(target) {
   return target;
 }
 
+// Smallest "round" time step >= target seconds, for the time axis.
+function niceTimeStep(target) {
+  for (const s of [60, 120, 300, 600, 900, 1800, 3600, 7200, 14400, 21600, 43200, 86400, 172800]) {
+    if (s >= target) return s;
+  }
+  return target;
+}
+function fmtAxisSecs(s) {
+  if (s % 3600 === 0) return (s / 3600) + 'h';
+  if (s % 60 === 0) return (s / 60) + 'm';
+  return fmtDur(s);
+}
+
+// Points covering the last SPEED_WINDOW_S seconds, or the whole session.
+function visibleHist() {
+  if (speedFullRange || !speedHist.length) return speedHist;
+  const tEnd = speedHist[speedHist.length - 1][0];
+  const t0 = tEnd - SPEED_WINDOW_S;
+  let i = speedHist.length - 1;
+  while (i > 0 && speedHist[i][0] > t0) i--;
+  return speedHist.slice(i);
+}
+
 function drawSpeedChart() {
   const cv = document.getElementById('speedchart'), ctx = cv.getContext('2d');
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   const W = cv.clientWidth, H = cv.clientHeight, pad = 4;
   ctx.clearRect(0, 0, W, H);
-  if (!speedHist.length) return;
-  const peak = Math.max(1024, ...speedHist.map(p => Math.max(p.d, p.u)));
-  const peakD = speedPeak.d;
-  const peakU = speedPeak.u;
+  const pts = visibleHist();
+  if (!pts.length) return;
+  const tEnd = pts[pts.length - 1][0];
+  const tStart = speedFullRange ? 0 : tEnd - SPEED_WINDOW_S;
+  const spanT = Math.max(1, tEnd - tStart);
+  const peak = Math.max(1024, ...pts.map(p => Math.max(p[1], p[2])));
   const max = peak * 1.1;
-  const off = SPEED_HIST_MAX - speedHist.length;
-  const x = i => pad + i * (W - 2 * pad) / (SPEED_HIST_MAX - 1);
+  const x = t => pad + (t - tStart) / spanT * (W - 2 * pad);
   const y = v => H - pad - (v / max) * (H - 2 * pad);
 
   // rate gridlines, drawn under the series
@@ -196,23 +255,24 @@ function drawSpeedChart() {
     ctx.beginPath(); ctx.moveTo(pad, yy); ctx.lineTo(W - pad, yy); ctx.stroke();
   }
 
-  for (const [key, color] of [['d', '#5aa9e6'], ['u', '#7ee2a8']]) {
+  for (const [idx, color] of [[1, '#5aa9e6'], [2, '#7ee2a8']]) {
     ctx.beginPath();
-    ctx.moveTo(x(off), H - pad);
-    speedHist.forEach((p, i) => ctx.lineTo(x(off + i), y(p[key])));
-    ctx.lineTo(x(SPEED_HIST_MAX - 1), H - pad);
+    ctx.moveTo(x(pts[0][0]), H - pad);
+    pts.forEach(p => ctx.lineTo(x(p[0]), y(p[idx])));
+    ctx.lineTo(x(tEnd), H - pad);
     ctx.closePath();
     ctx.fillStyle = color + '22';
     ctx.fill();
     ctx.beginPath();
-    speedHist.forEach((p, i) => {
-      const xx = x(off + i);
-      if (i === 0) ctx.moveTo(xx, y(p[key])); else ctx.lineTo(xx, y(p[key]));
+    pts.forEach((p, i) => {
+      if (i === 0) ctx.moveTo(x(p[0]), y(p[idx])); else ctx.lineTo(x(p[0]), y(p[idx]));
     });
     ctx.strokeStyle = color;
     ctx.lineWidth = 1.5;
     ctx.stroke();
   }
+
+  const avgD = sessionAvg.d, avgU = sessionAvg.u;
 
   // labels go last so fills can't cover them; y clamped so the top rate
   // label isn't clipped, x clamped so edge time labels stay on canvas
@@ -223,21 +283,20 @@ function drawSpeedChart() {
     ctx.fillText(fmtShort(v) + '/s', pad + 2, Math.max(11, y(v) - 2));
   }
   ctx.textAlign = 'center';
-  for (let m = 5; m * 60 <= SPEED_HIST_MAX; m += 5) {
-    const label = '-' + m + 'm';
+  const tStep = niceTimeStep(spanT / 5);
+  for (let s = tStep; s < spanT; s += tStep) {
+    const label = '-' + fmtAxisSecs(s);
     const half = ctx.measureText(label).width / 2;
-    const lx = Math.min(Math.max(x(SPEED_HIST_MAX - 1 - m * 60), pad + half), W - pad - half);
+    const lx = Math.min(Math.max(x(tEnd - s), pad + half), W - pad - half);
     ctx.fillText(label, lx, H - pad - 1);
   }
-  ctx.font = '11px system-ui';
-  ctx.textAlign = 'right';
-  const peakUTxt = 'Peak ↑ ' + fmtBytes(peakU) + '/s';
-  const peakDTxt = 'Peak ↓ ' + fmtBytes(peakD) + '/s';
-  ctx.fillStyle = '#7ee2a8';
-  ctx.fillText(peakUTxt, W - pad - 2, 13);
-  ctx.fillStyle = '#5aa9e6';
-  ctx.fillText(peakDTxt, W - pad - 2 - ctx.measureText(peakUTxt).width - 10, 13);
-  ctx.textAlign = 'left';
+  // peak/average live in the header row — the label word stays neutral
+  // since it applies to both series; values keep their series colors.
+  const V = id => document.getElementById(id);
+  V('ss-peak-d').textContent = '↓ ' + fmtBytes(speedPeak.d) + '/s';
+  V('ss-peak-u').textContent = '↑ ' + fmtBytes(speedPeak.u) + '/s';
+  V('ss-avg-d').textContent = '↓ ' + fmtBytes(avgD) + '/s';
+  V('ss-avg-u').textContent = '↑ ' + fmtBytes(avgU) + '/s';
 }
 
 // ---- Swarm constellation ----
@@ -763,6 +822,25 @@ function updatePeerTable(all) {
   }
 }
 
+// draggable split between the speed chart and the swarm visualization
+document.getElementById('hdivider').addEventListener('mousedown', e => {
+  e.preventDefault();
+  const hdiv = e.target, chart = document.getElementById('speedchart');
+  hdiv.classList.add('drag');
+  const move = ev => {
+    const h = ev.clientY - chart.getBoundingClientRect().top;
+    chart.style.height = Math.min(Math.max(50, h), window.innerHeight * 0.7) + 'px';
+    sizeCanvases();
+  };
+  const up = () => {
+    hdiv.classList.remove('drag');
+    document.removeEventListener('mousemove', move);
+    document.removeEventListener('mouseup', up);
+  };
+  document.addEventListener('mousemove', move);
+  document.addEventListener('mouseup', up);
+});
+
 // draggable split between visualization and stats columns
 document.getElementById('divider').addEventListener('mousedown', e => {
   e.preventDefault();
@@ -799,9 +877,10 @@ function onStats(s) {
   V('torhead').textContent = 'Active torrents (' + (s.activeTorrentCount || 0) + ')';
   latestSpeeds.d = s.downloadSpeed || 0;
   latestSpeeds.u = s.uploadSpeed || 0;
+  sessionAvg.d = c.secondsActive ? (c.downloadedBytes || 0) / c.secondsActive : 0;
+  sessionAvg.u = c.secondsActive ? (c.uploadedBytes || 0) / c.secondsActive : 0;
   V('v-txfer').textContent = '↓' + fmtBytes(cum.downloadedBytes || 0) + ' / ↑' + fmtBytes(cum.uploadedBytes || 0);
   V('v-tratio').textContent = fmtRatio(cum.uploadedBytes, cum.downloadedBytes);
-  pushSpeed(s.downloadSpeed || 0, s.uploadSpeed || 0);
   document.title = '↓' + fmtShort(s.downloadSpeed || 0) + '/s ' + fmtShort(c.downloadedBytes || 0)
     + ' | ↑' + fmtShort(s.uploadSpeed || 0) + '/s ' + fmtShort(c.uploadedBytes || 0)
     + ' | ' + fmtRatio(cum.uploadedBytes, cum.downloadedBytes);
@@ -896,6 +975,26 @@ function declareGone(msg) {
 }
 evs.addEventListener('status', e => { clearGone(); onStats(JSON.parse(e.data)); });
 evs.addEventListener('torrents', e => { clearGone(); onTorrents(JSON.parse(e.data)); });
+evs.addEventListener('history', e => {
+  // Whole-session snapshot, sent on (re)subscribe and whenever the server
+  // compacts old samples into coarser buckets — replaces local state.
+  clearGone();
+  const h = JSON.parse(e.data);
+  speedHist = h.points || [];
+  speedPeak.d = h.peak_d || 0;
+  speedPeak.u = h.peak_u || 0;
+  drawSpeedChart();
+});
+evs.addEventListener('speed', e => {
+  clearGone();
+  const p = JSON.parse(e.data);
+  if (!speedHist.length || p.t > speedHist[speedHist.length - 1][0]) {
+    speedHist.push([p.t, p.d, p.u]);
+  }
+  speedPeak.d = p.peak_d;
+  speedPeak.u = p.peak_u;
+  drawSpeedChart();
+});
 evs.addEventListener('port', e => {
   clearGone();
   const p = JSON.parse(e.data);
@@ -922,6 +1021,7 @@ evs.onerror = () => {
 };
 
 renderPorts();
+applySpeedRange();
 requestAnimationFrame(tick);
 </script>
 </body>

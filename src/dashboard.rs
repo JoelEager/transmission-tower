@@ -1,14 +1,142 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use crate::Logger;
 use crate::rpc::RpcClient;
+
+/// One speed sample covering `span` seconds ending `t` seconds after the
+/// poller started. `d`/`u` are the average rates over that span.
+struct SpeedSample {
+    t: u64,
+    span: u64,
+    d: f64,
+    u: f64,
+}
+
+/// Bounded speed history for the whole session, kept at two resolutions:
+///
+/// - `recent` — the last ~15 minutes at full 1 s granularity, covering the
+///   chart's 10-minute window with margin.
+/// - `archive` — everything older, at a uniform `hist_span` granularity that
+///   doubles whenever the archive exceeds [`ARCHIVE_CAP`]. The beginning of
+///   the session always keeps roughly session/600-second resolution instead
+///   of collapsing into one giant average.
+///
+/// `pending` accumulates 1 s samples rolling out of `recent` until they fill
+/// one `hist_span` bucket. Total memory stays under ~1500 samples.
+pub struct SpeedHistory {
+    start: Instant,
+    recent: VecDeque<SpeedSample>,
+    archive: VecDeque<SpeedSample>,
+    pending: Option<SpeedSample>,
+    hist_span: u64,
+    peak_d: f64,
+    peak_u: f64,
+}
+
+/// Recent window at full resolution (15 min > the chart's 10 min view).
+const RECENT_CAP: usize = 900;
+/// Long-term samples; granularity doubles when this fills, so even after a
+/// 12 h run the archive still holds ~340 points at ~2 min resolution.
+const ARCHIVE_CAP: usize = 600;
+
+/// Merges two chronologically adjacent samples into a span-weighted
+/// average stamped with the newer sample's end time.
+fn combine(older: SpeedSample, newer: SpeedSample) -> SpeedSample {
+    let span = older.span + newer.span;
+    SpeedSample {
+        t: newer.t,
+        d: (older.d * older.span as f64 + newer.d * newer.span as f64) / span as f64,
+        u: (older.u * older.span as f64 + newer.u * newer.span as f64) / span as f64,
+        span,
+    }
+}
+
+impl SpeedHistory {
+    /// Records one second's rates. Returns the sample's end timestamp and
+    /// whether the compacted view changed in a way raw 1 s samples can't
+    /// replicate — i.e. the archive emitted a bucket coarser than a second.
+    /// While `hist_span` is still 1 the archive holds raw samples identical
+    /// to what clients append themselves, so no resend is needed; once it
+    /// coarsens, subscribers get a fresh `history` snapshot at each flush
+    /// (every `hist_span` seconds) so their local copy stays bounded.
+    fn push(&mut self, d: f64, u: f64) -> (u64, bool) {
+        let t = self.start.elapsed().as_secs();
+        self.peak_d = self.peak_d.max(d);
+        self.peak_u = self.peak_u.max(u);
+        self.recent.push_back(SpeedSample { t, span: 1, d, u });
+        let mut flushed = false;
+        if self.recent.len() > RECENT_CAP {
+            let aged = self.recent.pop_front().unwrap();
+            flushed = self.archive_sample(aged);
+        }
+        (t, flushed && self.hist_span > 1)
+    }
+
+    /// Folds a sample into the pending bucket; returns true when a bucket
+    /// was emitted into the archive (or the archive was re-paired).
+    fn archive_sample(&mut self, s: SpeedSample) -> bool {
+        self.pending = Some(match self.pending.take() {
+            Some(p) => combine(p, s),
+            None => s,
+        });
+        if self.pending.as_ref().unwrap().span < self.hist_span {
+            return false;
+        }
+        self.archive.push_back(self.pending.take().unwrap());
+        if self.archive.len() > ARCHIVE_CAP {
+            self.hist_span *= 2;
+            let mut merged = VecDeque::with_capacity(ARCHIVE_CAP / 2 + 1);
+            while self.archive.len() >= 2 {
+                let a = self.archive.pop_front().unwrap();
+                let b = self.archive.pop_front().unwrap();
+                merged.push_back(combine(a, b));
+            }
+            // An odd tail sample is older than `pending` — fold it in so
+            // no coverage is lost at the boundary.
+            if let Some(last) = self.archive.pop_front() {
+                self.pending = Some(match self.pending.take() {
+                    Some(p) => combine(last, p),
+                    None => last,
+                });
+            }
+            self.archive = merged;
+        }
+        true
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "elapsed": self.start.elapsed().as_secs(),
+            "peak_d": self.peak_d,
+            "peak_u": self.peak_u,
+            "points": self.archive.iter()
+                .chain(self.pending.iter())
+                .chain(self.recent.iter())
+                .map(|s| json!([s.t, s.d, s.u])).collect::<Vec<_>>(),
+        })
+    }
+}
+
+impl Default for SpeedHistory {
+    fn default() -> Self {
+        Self {
+            start: Instant::now(),
+            recent: VecDeque::new(),
+            archive: VecDeque::new(),
+            pending: None,
+            hist_span: 1,
+            peak_d: 0.0,
+            peak_u: 0.0,
+        }
+    }
+}
 
 /// Shared dashboard state: the latest result of each RPC poll plus the set of
 /// SSE client streams subscribed to updates. The poller is the only writer;
@@ -21,6 +149,7 @@ pub struct Hub {
     pub session: Option<Value>,
     torrents: Option<Value>,
     port: Option<Value>,
+    speed: SpeedHistory,
     clients: Vec<TcpStream>,
 }
 
@@ -35,7 +164,9 @@ impl Hub {
 
     /// Writes the cached snapshot of each event stream so a freshly opened
     /// page renders immediately instead of waiting for the next poll tick.
+    /// The speed history goes first so its baseline precedes live updates.
     fn replay(&self, stream: &mut TcpStream) -> io::Result<()> {
+        stream.write_all(sse_frame("history", &self.speed.to_json()).as_bytes())?;
         for (event, value) in [
             ("status", &self.session),
             ("torrents", &self.torrents),
@@ -97,6 +228,20 @@ impl Poller {
                 let mut hub = self.hub.lock().unwrap();
                 hub.session = Some(args.clone());
                 hub.broadcast("status", &args);
+                let d = args["downloadSpeed"].as_f64().unwrap_or(0.0);
+                let u = args["uploadSpeed"].as_f64().unwrap_or(0.0);
+                let (t, compacted) = hub.speed.push(d, u);
+                let (peak_d, peak_u) = (hub.speed.peak_d, hub.speed.peak_u);
+                hub.broadcast(
+                    "speed",
+                    &json!({ "t": t, "d": d, "u": u, "peak_d": peak_d, "peak_u": peak_u }),
+                );
+                // The archive just merged raw seconds into a coarser bucket;
+                // push the new snapshot so clients can drop their raw copies.
+                if compacted {
+                    let snapshot = hub.speed.to_json();
+                    hub.broadcast("history", &snapshot);
+                }
             }
             Err(e) => self
                 .hub
@@ -638,6 +783,7 @@ mod tests {
             session: Some(json!({"a": 1})),
             torrents: None,
             port: Some(json!({"p": 2})),
+            speed: SpeedHistory::default(),
             clients: Vec::new(),
         };
         hub.replay(&mut writer).unwrap();
@@ -645,9 +791,84 @@ mod tests {
 
         let mut buf = String::new();
         reader.read_to_string(&mut buf).unwrap();
+        assert!(buf.contains("event: history"), "{}", buf);
         assert!(buf.contains("event: status\ndata: {\"a\":1}"), "{}", buf);
         assert!(buf.contains("event: port\ndata: {\"p\":2}"), "{}", buf);
         assert!(!buf.contains("event: torrents"), "{}", buf);
+    }
+
+    /// Pushing past the cap merges the oldest samples into span-weighted
+    /// averages while the tail stays at full 1 s resolution — memory stays
+    /// bounded but coverage reaches back to session start.
+    #[test]
+    fn test_speed_history_decimates_oldest_samples() {
+        let mut hist = SpeedHistory::default();
+        // Artificially age the clock so timestamps are nonzero.
+        hist.start = Instant::now() - Duration::from_secs(2000);
+        let pushes = RECENT_CAP + ARCHIVE_CAP + 5;
+        for _ in 0..pushes {
+            hist.push(100.0, 50.0);
+        }
+        assert_eq!(hist.recent.len(), RECENT_CAP);
+        assert!(hist.recent.iter().all(|s| s.span == 1));
+        assert!(!hist.archive.is_empty());
+        // Archive buckets are all at the current uniform granularity.
+        assert!(hist.archive.iter().all(|s| s.span == hist.hist_span));
+        // Nothing is dropped: archive + pending + recent cover every push.
+        let coverage: u64 = hist
+            .archive
+            .iter()
+            .chain(hist.pending.iter())
+            .chain(hist.recent.iter())
+            .map(|s| s.span)
+            .sum();
+        assert_eq!(coverage, pushes as u64);
+        // Constant input rates survive averaging exactly.
+        assert_eq!(hist.archive[0].d, 100.0);
+        assert_eq!(hist.archive[0].u, 50.0);
+        assert_eq!(hist.peak_d, 100.0);
+
+        // Serialized points are non-decreasing in time.
+        let j = hist.to_json();
+        let pts = j["points"].as_array().unwrap();
+        assert!(
+            pts.windows(2)
+                .all(|w| w[0][0].as_u64().unwrap() <= w[1][0].as_u64().unwrap())
+        );
+    }
+
+    /// Once the archive fills, granularity doubles and the sample count
+    /// halves — long sessions stay bounded at uniform resolution.
+    #[test]
+    fn test_speed_history_archive_granularity_doubles() {
+        let mut hist = SpeedHistory::default();
+        hist.start = Instant::now() - Duration::from_secs(10_000);
+        for _ in 0..RECENT_CAP + ARCHIVE_CAP * 2 {
+            hist.push(100.0, 50.0);
+        }
+        assert!(hist.archive.len() <= ARCHIVE_CAP);
+        assert_eq!(hist.hist_span, 2);
+        assert!(hist.archive.iter().all(|s| s.span == 2));
+    }
+
+    /// The dirty flag that triggers a `history` resend only fires once
+    /// buckets are coarser than a second — before that, client-side raw
+    /// appends replicate the server's view exactly.
+    #[test]
+    fn test_speed_history_dirty_only_after_coarsening() {
+        let mut hist = SpeedHistory::default();
+        // Aged samples flush as 1 s archive buckets — never dirty.
+        for _ in 0..RECENT_CAP + 5 {
+            assert!(!hist.push(1.0, 1.0).1);
+        }
+        // Pushing past ARCHIVE_CAP doubles hist_span; some later push must
+        // report dirty once flushes emit coarser buckets.
+        let mut saw_dirty = false;
+        for _ in 0..ARCHIVE_CAP * 2 {
+            saw_dirty |= hist.push(1.0, 1.0).1;
+        }
+        assert!(saw_dirty);
+        assert!(hist.hist_span > 1);
     }
 
     #[test]
@@ -730,6 +951,7 @@ mod tests {
         }
         let text = String::from_utf8_lossy(&buf).to_string();
         assert!(text.contains("event: status\ndata: {\"ok\":true}"), "{}", text);
+        assert!(text.contains("event: speed"), "{}", text);
         assert!(text.contains("event: torrents"), "{}", text);
         assert!(text.contains("event: port"), "{}", text);
         assert!(text.contains("\"ipv4\":\"closed\""), "{}", text);
