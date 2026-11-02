@@ -398,6 +398,14 @@ fn handle_conn(mut stream: TcpStream, hub: &Mutex<Hub>, hostname: &str) {
                     return;
                 }
             }
+            ("GET", "/icon.svg") => {
+                if !write_response(&mut stream, 200, "image/svg+xml", ICON_SVG, keep_alive) {
+                    return;
+                }
+                if !keep_alive {
+                    return;
+                }
+            }
             ("GET", "/events") => {
                 // The stream now lives in the hub; nothing more to do here.
                 subscribe_events(stream, hub);
@@ -594,6 +602,7 @@ fn reason(status: u16) -> &'static str {
 }
 
 const INDEX_HTML: &str = include_str!("dashboard.html");
+const ICON_SVG: &str = include_str!("../icon.svg");
 
 #[cfg(test)]
 mod tests {
@@ -719,6 +728,16 @@ mod tests {
         assert!(resp.contains("200 OK"));
         assert!(resp.contains("<title>Transmission Tower</title>"));
         assert!(!resp.contains("[hostname]"));
+    }
+
+    #[test]
+    fn test_dashboard_serves_icon() {
+        let (dash_port, _hub) = spawn_dashboard();
+
+        let resp = get(dash_port, "/icon.svg");
+        assert!(resp.contains("200 OK"));
+        assert!(resp.contains("Content-Type: image/svg+xml"));
+        assert!(resp.contains("<svg"));
     }
 
     /// Subscribing to /events yields an SSE stream that carries the
