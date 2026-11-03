@@ -20,31 +20,37 @@ use serde_json::{Value, json};
 #[command(
     author,
     version,
-    about = "Transmission session companion: applies the forwarded port, launches the client, and serves a live dashboard."
+    about = "Transmission session companion: applies the forwarded port, launches Transmission, and serves a live dashboard."
 )]
 pub struct Args {
-    /// Directory containing the `transmission/settings.json` file.
+    /// Directory containing Transmission's `settings.json` file.
     /// Defaults to %LOCALAPPDATA% on Windows, or ~/.config on Linux/macOS.
     #[arg(long)]
-    pub config_dir: Option<PathBuf>,
+    pub transmission_config_dir: Option<PathBuf>,
 
     /// Path to the Transmission executable.
     /// Defaults to `C:\Program Files\Transmission\transmission-qt.exe` on Windows, or `transmission-qt` on Linux/macOS.
     #[arg(long)]
     pub transmission_path: Option<PathBuf>,
 
-    /// Directory holding the config file, session history, and log file.
+    /// Arguments passed to the Transmission executable, split on whitespace.
+    /// Defaults to `--minimized`; pass an empty value to launch without arguments.
+    #[arg(long)]
+    pub transmission_args: Option<String>,
+
+    /// Directory holding this tool's config file, session history, and log file.
     /// Defaults to `~/.transmission-tower`.
     #[arg(long)]
-    pub data_dir: Option<PathBuf>,
+    pub tower_dir: Option<PathBuf>,
 
     /// Override port value directly instead of reading from clipboard.
     #[arg(long)]
     pub port: Option<u16>,
 
-    /// Skip launching Transmission (useful for dry runs and testing).
+    /// Seconds to wait for the forwarded port to appear on the clipboard.
+    /// Defaults to 30.
     #[arg(long)]
-    pub skip_launch: bool,
+    pub port_timeout: Option<u64>,
 
     /// Output log messages to standard output in addition to the log file.
     #[arg(short, long)]
@@ -53,6 +59,10 @@ pub struct Args {
     /// Disable the local session dashboard shown in the browser.
     #[arg(long)]
     pub no_dashboard: bool,
+
+    /// Don't open the dashboard in the browser automatically.
+    #[arg(long)]
+    pub no_browser: bool,
 
     /// Localhost port for the session dashboard server. Defaults to 9191.
     #[arg(long)]
@@ -96,25 +106,27 @@ impl Logger {
     }
 }
 
-fn default_data_dir() -> Result<PathBuf, String> {
+fn default_tower_dir() -> Result<PathBuf, String> {
     dirs::home_dir()
         .map(|home| home.join(".transmission-tower"))
         .ok_or_else(|| "Could not determine user home directory".to_string())
 }
 
-/// Values read from `<data-dir>/config.json`. Every field is optional:
+/// Values read from `<tower-dir>/config.json`. Every field is optional:
 /// absent or null falls back to the built-in default. Keys not listed
 /// here are collected in `extra` so they can be called out in the log
 /// rather than silently ignored (a typo'd key would otherwise look like
 /// a working setting).
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
-    config_dir: Option<PathBuf>,
+    transmission_config_dir: Option<PathBuf>,
     transmission_path: Option<PathBuf>,
+    transmission_args: Option<String>,
     port: Option<u16>,
-    skip_launch: Option<bool>,
+    port_timeout: Option<u64>,
     verbose: Option<bool>,
     no_dashboard: Option<bool>,
+    no_browser: Option<bool>,
     dashboard_port: Option<u16>,
     rpc_username: Option<String>,
     rpc_password: Option<String>,
@@ -126,12 +138,14 @@ struct FileConfig {
 /// Anything the CLI explicitly supplies wins; everything else comes from
 /// the config file, falling back to the built-in defaults.
 struct Settings {
-    config_dir: PathBuf,
+    transmission_config_dir: PathBuf,
     transmission_path: PathBuf,
+    transmission_args: Vec<String>,
     port: Option<u16>,
-    skip_launch: bool,
+    port_timeout: u64,
     verbose: bool,
     no_dashboard: bool,
+    no_browser: bool,
     dashboard_port: u16,
     rpc_username: Option<String>,
     rpc_password: Option<String>,
@@ -139,19 +153,32 @@ struct Settings {
 
 fn resolve_settings(args: &Args, cfg: &FileConfig) -> Result<Settings, String> {
     Ok(Settings {
-        config_dir: match args.config_dir.clone().or_else(|| cfg.config_dir.clone()) {
+        transmission_config_dir: match args
+            .transmission_config_dir
+            .clone()
+            .or_else(|| cfg.transmission_config_dir.clone())
+        {
             Some(dir) => dir,
-            None => default_config_dir()?,
+            None => default_transmission_config_dir()?,
         },
         transmission_path: args
             .transmission_path
             .clone()
             .or_else(|| cfg.transmission_path.clone())
             .unwrap_or_else(default_transmission_path),
+        transmission_args: args
+            .transmission_args
+            .clone()
+            .or(cfg.transmission_args.clone())
+            .unwrap_or_else(|| "--minimized".to_string())
+            .split_whitespace()
+            .map(String::from)
+            .collect(),
         port: args.port.or(cfg.port),
-        skip_launch: args.skip_launch || cfg.skip_launch.unwrap_or(false),
+        port_timeout: args.port_timeout.or(cfg.port_timeout).unwrap_or(30),
         verbose: args.verbose || cfg.verbose.unwrap_or(false),
         no_dashboard: args.no_dashboard || cfg.no_dashboard.unwrap_or(false),
+        no_browser: args.no_browser || cfg.no_browser.unwrap_or(false),
         dashboard_port: args.dashboard_port.or(cfg.dashboard_port).unwrap_or(9191),
         rpc_username: args.rpc_username.clone().or(cfg.rpc_username.clone()),
         rpc_password: args.rpc_password.clone().or(cfg.rpc_password.clone()),
@@ -162,12 +189,14 @@ fn resolve_settings(args: &Args, cfg: &FileConfig) -> Result<Settings, String> {
 /// `port` stays null to mean "read the forwarded port from the clipboard".
 fn write_default_config(path: &Path) -> Result<(), String> {
     let defaults = json!({
-        "config_dir": default_config_dir().ok(),
+        "transmission_config_dir": default_transmission_config_dir().ok(),
         "transmission_path": default_transmission_path(),
+        "transmission_args": "--minimized",
         "port": null,
-        "skip_launch": false,
+        "port_timeout": 30,
         "verbose": false,
         "no_dashboard": false,
+        "no_browser": false,
         "dashboard_port": 9191,
         "rpc_username": null,
         "rpc_password": null
@@ -178,7 +207,7 @@ fn write_default_config(path: &Path) -> Result<(), String> {
     fs::write(path, body).map_err(|e| format!("Failed to write {}: {}", path.display(), e))
 }
 
-fn default_config_dir() -> Result<PathBuf, String> {
+fn default_transmission_config_dir() -> Result<PathBuf, String> {
     if cfg!(target_os = "windows") {
         std::env::var("LOCALAPPDATA")
             .map(PathBuf::from)
@@ -196,12 +225,46 @@ fn default_transmission_path() -> PathBuf {
     }
 }
 
-fn get_port_from_clipboard() -> Result<u16, String> {
-    let mut clipboard =
-        Clipboard::new().map_err(|e| format!("Failed to access clipboard: {}", e))?;
-    let content = clipboard
-        .get_text()
-        .map_err(|e| format!("Failed to get clipboard text: {}", e))?;
+/// Clipboard text access, abstracted so tests can run without touching
+/// the real system clipboard.
+trait ClipboardText {
+    fn get_text(&mut self) -> Result<String, String>;
+    fn set_text(&mut self, text: &str) -> Result<(), String>;
+    fn clear(&mut self) -> Result<(), String>;
+}
+
+struct SystemClipboard(Clipboard);
+
+impl SystemClipboard {
+    fn new() -> Result<Self, String> {
+        Clipboard::new()
+            .map(SystemClipboard)
+            .map_err(|e| format!("Failed to access clipboard: {}", e))
+    }
+}
+
+impl ClipboardText for SystemClipboard {
+    fn get_text(&mut self) -> Result<String, String> {
+        self.0
+            .get_text()
+            .map_err(|e| format!("Failed to get clipboard text: {}", e))
+    }
+
+    fn set_text(&mut self, text: &str) -> Result<(), String> {
+        self.0
+            .set_text(text)
+            .map_err(|e| format!("Failed to set clipboard text: {}", e))
+    }
+
+    fn clear(&mut self) -> Result<(), String> {
+        self.0
+            .clear()
+            .map_err(|e| format!("Failed to clear clipboard: {}", e))
+    }
+}
+
+fn get_port_from_clipboard(clipboard: &mut dyn ClipboardText) -> Result<u16, String> {
+    let content = clipboard.get_text()?;
 
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -221,22 +284,16 @@ fn get_port_from_clipboard() -> Result<u16, String> {
     Ok(port)
 }
 
-fn clear_clipboard(logger: &Logger) {
-    match Clipboard::new() {
-        Ok(mut clipboard) => {
-            if clipboard.clear().is_err() {
-                // If clear fails, try setting empty text as fallback
-                let _ = clipboard.set_text("");
-            }
-        }
-        Err(e) => {
-            logger.log(&format!("Failed to access clipboard to reset: {}", e));
-        }
+fn clear_clipboard(clipboard: &mut dyn ClipboardText) {
+    if clipboard.clear().is_err() {
+        // If clear fails, try setting empty text as fallback
+        let _ = clipboard.set_text("");
     }
 }
 
 fn poll_port_from_clipboard_with_interval(
     logger: &Logger,
+    clipboard: &mut dyn ClipboardText,
     total_attempts: u32,
     sleep_duration: std::time::Duration,
 ) -> Result<u16, String> {
@@ -245,29 +302,41 @@ fn poll_port_from_clipboard_with_interval(
     let mut last_err = String::new();
     for _ in 0..total_attempts {
         std::thread::sleep(sleep_duration);
-        match get_port_from_clipboard() {
+        match get_port_from_clipboard(clipboard) {
             Ok(port) => {
-                clear_clipboard(logger);
+                clear_clipboard(clipboard);
                 return Ok(port);
             }
             Err(err_msg) => last_err = err_msg,
         }
     }
 
+    let waited = sleep_duration * total_attempts;
+    let waited_str = if waited.as_secs() >= 1 {
+        format!("{} seconds", waited.as_secs())
+    } else {
+        format!("{}ms", waited.as_millis())
+    };
     let failure_msg = if last_err.is_empty() {
-        "Failed to find a valid port on clipboard after 30 seconds.".to_string()
+        format!("Failed to find a valid port on clipboard after {}.", waited_str)
     } else {
         format!(
-            "Failed to find a valid port on clipboard after 30 seconds: {}",
-            last_err
+            "Failed to find a valid port on clipboard after {}: {}",
+            waited_str, last_err
         )
     };
     logger.log(&failure_msg);
     Err(failure_msg)
 }
 
-fn poll_port_from_clipboard(logger: &Logger) -> Result<u16, String> {
-    poll_port_from_clipboard_with_interval(logger, 6, std::time::Duration::from_secs(5))
+fn poll_port_from_clipboard(logger: &Logger, timeout_secs: u64) -> Result<u16, String> {
+    let mut clipboard = SystemClipboard::new()?;
+    poll_port_from_clipboard_with_interval(
+        logger,
+        &mut clipboard,
+        (timeout_secs.max(1) as u32).div_ceil(5),
+        std::time::Duration::from_secs(5),
+    )
 }
 
 /// Updates `settings.json` with the new peer port and returns the configured
@@ -275,12 +344,14 @@ fn poll_port_from_clipboard(logger: &Logger) -> Result<u16, String> {
 /// to localhost — Transmission ignores all other remote-access settings when
 /// binding to a loopback address.
 fn update_settings_file(
-    config_dir: &Path,
+    transmission_config_dir: &Path,
     port: u16,
     enable_rpc: bool,
     logger: &Logger,
 ) -> Result<u16, String> {
-    let settings_path = config_dir.join("transmission").join("settings.json");
+    let settings_path = transmission_config_dir
+        .join("transmission")
+        .join("settings.json");
     let settings_path_str = settings_path.to_string_lossy();
     logger.log(&format!("Opening {}", settings_path_str));
 
@@ -352,19 +423,15 @@ fn run_app_logic(
             p
         }
         None => {
-            let p = poll_port_from_clipboard(logger)?;
+            let p = poll_port_from_clipboard(logger, settings.port_timeout)?;
             logger.log(&format!("Using port {} from clipboard", p));
             p
         }
     };
 
-    let dashboard_enabled = !settings.no_dashboard && !settings.skip_launch;
-    let rpc_port = update_settings_file(&settings.config_dir, port, dashboard_enabled, logger)?;
-
-    if settings.skip_launch {
-        logger.log("Transmission launch skipped per --skip-launch flag");
-        return Ok(());
-    }
+    let dashboard_enabled = !settings.no_dashboard;
+    let rpc_port =
+        update_settings_file(&settings.transmission_config_dir, port, dashboard_enabled, logger)?;
 
     let trans_path = settings.transmission_path.clone();
     let started_at = Local::now();
@@ -389,12 +456,13 @@ fn run_app_logic(
             history_path,
             logger,
         )
+            && !settings.no_browser
         {
             dashboard::open_in_browser(&url, logger);
         }
     }
 
-    let result = run_transmission(&trans_path, &hub, logger);
+    let result = run_transmission(&trans_path, &settings.transmission_args, &hub, logger);
     if let Ok(status) = &result {
         append_history(history_path, started_at, Local::now(), *status, &hub, logger);
     }
@@ -453,16 +521,22 @@ fn append_history(
 
 fn run_transmission(
     trans_path: &Path,
+    transmission_args: &[String],
     hub: &Mutex<dashboard::Hub>,
     logger: &Logger,
 ) -> Result<std::process::ExitStatus, String> {
-    let mut child = Command::new(trans_path).spawn().map_err(|e| {
-        format!(
-            "Failed to launch Transmission at '{}': {}",
-            trans_path.display(),
-            e
-        )
-    })?;
+    let mut child = Command::new(trans_path)
+        .args(transmission_args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            format!(
+                "Failed to launch Transmission at '{}': {}",
+                trans_path.display(),
+                e
+            )
+        })?;
 
     let status = loop {
         match child.try_wait() {
@@ -529,21 +603,21 @@ fn format_duration(seconds: f64) -> String {
 }
 
 fn run_app(args: Args) -> Result<(), String> {
-    let data_dir = match &args.data_dir {
+    let tower_dir = match &args.tower_dir {
         Some(dir) => dir.clone(),
-        None => default_data_dir()?,
+        None => default_tower_dir()?,
     };
-    fs::create_dir_all(&data_dir).map_err(|e| {
+    fs::create_dir_all(&tower_dir).map_err(|e| {
         format!(
-            "Failed to create data directory {}: {}",
-            data_dir.display(),
+            "Failed to create tower directory {}: {}",
+            tower_dir.display(),
             e
         )
     })?;
 
-    let config_path = data_dir.join("config.json");
-    let history_path = data_dir.join("history.jsonl");
-    let log_path = data_dir.join("transmission-tower.log");
+    let config_path = tower_dir.join("config.json");
+    let history_path = tower_dir.join("history.jsonl");
+    let log_path = tower_dir.join("transmission-tower.log");
 
     // Messages buffered until the logger exists (the verbose setting can
     // itself come from the config file being read here).
@@ -655,8 +729,24 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// Serializes tests that mutate the shared system clipboard.
-    static CLIPBOARD_LOCK: Mutex<()> = Mutex::new(());
+    /// In-memory clipboard so tests never touch the real system clipboard.
+    struct FakeClipboard(String);
+
+    impl ClipboardText for FakeClipboard {
+        fn get_text(&mut self) -> Result<String, String> {
+            Ok(self.0.clone())
+        }
+
+        fn set_text(&mut self, text: &str) -> Result<(), String> {
+            self.0 = text.to_string();
+            Ok(())
+        }
+
+        fn clear(&mut self) -> Result<(), String> {
+            self.0.clear();
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_update_settings_file() {
@@ -711,20 +801,31 @@ mod tests {
         assert_eq!(parsed["rpc-whitelist"], "127.0.0.1,::1");
     }
 
+    /// An executable that exits immediately, standing in for Transmission
+    /// so `run_app` tests don't launch the real client.
+    fn stub_transmission() -> PathBuf {
+        if cfg!(target_os = "windows") {
+            PathBuf::from(r"C:\Windows\System32\whoami.exe")
+        } else {
+            PathBuf::from("/bin/true")
+        }
+    }
+
     fn test_args(
-        config_dir: &Path,
-        data_dir: &Path,
+        transmission_config_dir: &Path,
+        tower_dir: &Path,
         port: Option<u16>,
-        skip_launch: bool,
     ) -> Args {
         Args {
-            config_dir: Some(config_dir.to_path_buf()),
-            transmission_path: None,
-            data_dir: Some(data_dir.to_path_buf()),
+            transmission_config_dir: Some(transmission_config_dir.to_path_buf()),
+            transmission_path: Some(stub_transmission()),
+            transmission_args: None,
+            tower_dir: Some(tower_dir.to_path_buf()),
             port,
-            skip_launch,
+            port_timeout: None,
             verbose: false,
-            no_dashboard: false,
+            no_dashboard: true,
+            no_browser: false,
             dashboard_port: None,
             rpc_username: None,
             rpc_password: None,
@@ -732,23 +833,23 @@ mod tests {
     }
 
     #[test]
-    fn test_default_data_dir() {
+    fn test_default_tower_dir() {
         let home = dirs::home_dir().expect("Home dir should be present in test env");
         let expected = home.join(".transmission-tower");
-        assert_eq!(default_data_dir().unwrap(), expected);
+        assert_eq!(default_tower_dir().unwrap(), expected);
     }
 
     #[test]
-    fn test_run_app_with_port_override_and_skip_launch() {
+    fn test_run_app_with_port_override() {
         let dir = tempdir().unwrap();
-        let data_dir = tempdir().unwrap();
+        let tower_dir = tempdir().unwrap();
         let trans_dir = dir.path().join("transmission");
         fs::create_dir_all(&trans_dir).unwrap();
         let settings_file = trans_dir.join("settings.json");
 
         fs::write(&settings_file, r#"{"peer-port": 12345}"#).unwrap();
 
-        let args = test_args(dir.path(), data_dir.path(), Some(60000), true);
+        let args = test_args(dir.path(), tower_dir.path(), Some(60000));
         assert!(run_app(args).is_ok());
 
         let updated_content = fs::read_to_string(&settings_file).unwrap();
@@ -756,9 +857,9 @@ mod tests {
         assert_eq!(parsed["peer-port"], 60000);
 
         let log_content =
-            fs::read_to_string(data_dir.path().join("transmission-tower.log")).unwrap();
+            fs::read_to_string(tower_dir.path().join("transmission-tower.log")).unwrap();
         assert!(log_content.contains("Successfully updated port to 60000"));
-        assert!(log_content.contains("Transmission launch skipped"));
+        assert!(log_content.contains("Transmission exited"));
     }
 
     /// First start writes config.json populated with the defaults; on the
@@ -766,19 +867,22 @@ mod tests {
     #[test]
     fn test_config_created_then_merged_with_cli_overrides() {
         let dir = tempdir().unwrap();
-        let data_dir = tempdir().unwrap();
+        let tower_dir = tempdir().unwrap();
         let trans_dir = dir.path().join("transmission");
         fs::create_dir_all(&trans_dir).unwrap();
         fs::write(trans_dir.join("settings.json"), r#"{"peer-port": 1}"#).unwrap();
 
-        let args = test_args(dir.path(), data_dir.path(), Some(60000), true);
+        let args = test_args(dir.path(), tower_dir.path(), Some(60000));
         assert!(run_app(args).is_ok());
 
-        let config_path = data_dir.path().join("config.json");
+        let config_path = tower_dir.path().join("config.json");
         let cfg_text = fs::read_to_string(&config_path).unwrap();
         let cfg_json: Value = serde_json::from_str(&cfg_text).unwrap();
         assert_eq!(cfg_json["dashboard_port"], 9191);
         assert_eq!(cfg_json["verbose"], false);
+        assert_eq!(cfg_json["no_browser"], false);
+        assert_eq!(cfg_json["port_timeout"], 30);
+        assert_eq!(cfg_json["transmission_args"], "--minimized");
         assert!(cfg_json["port"].is_null());
         assert!(cfg_json["transmission_path"].is_string());
 
@@ -786,13 +890,13 @@ mod tests {
         fs::write(&config_path, cfg_text.replace("9191", "4242")).unwrap();
         let cfg: FileConfig =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        let args = test_args(dir.path(), data_dir.path(), Some(60000), true);
+        let args = test_args(dir.path(), tower_dir.path(), Some(60000));
         let settings = resolve_settings(&args, &cfg).unwrap();
         assert_eq!(settings.dashboard_port, 4242);
         assert_eq!(settings.port, Some(60000));
 
         // …and the CLI wins when both are present.
-        let mut args = test_args(dir.path(), data_dir.path(), Some(60000), true);
+        let mut args = test_args(dir.path(), tower_dir.path(), Some(60000));
         args.dashboard_port = Some(1111);
         let settings = resolve_settings(&args, &cfg).unwrap();
         assert_eq!(settings.dashboard_port, 1111);
@@ -801,60 +905,57 @@ mod tests {
     #[test]
     fn test_run_app_missing_settings_file() {
         let dir = tempdir().unwrap();
-        let data_dir = tempdir().unwrap();
+        let tower_dir = tempdir().unwrap();
 
-        let args = test_args(dir.path(), data_dir.path(), Some(60000), true);
+        let args = test_args(dir.path(), tower_dir.path(), Some(60000));
         let result = run_app(args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Settings file does not exist"));
 
         let log_content =
-            fs::read_to_string(data_dir.path().join("transmission-tower.log")).unwrap();
+            fs::read_to_string(tower_dir.path().join("transmission-tower.log")).unwrap();
         assert!(log_content.contains("ERROR: Settings file does not exist"));
     }
 
     #[test]
     fn test_port_zero_validation() {
         let dir = tempdir().unwrap();
-        let data_dir = tempdir().unwrap();
+        let tower_dir = tempdir().unwrap();
 
-        let args = test_args(dir.path(), data_dir.path(), Some(0), true);
+        let args = test_args(dir.path(), tower_dir.path(), Some(0));
         let result = run_app(args);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Port number cannot be 0");
 
         let log_content =
-            fs::read_to_string(data_dir.path().join("transmission-tower.log")).unwrap();
+            fs::read_to_string(tower_dir.path().join("transmission-tower.log")).unwrap();
         assert!(log_content.contains("ERROR: Port number cannot be 0"));
     }
 
     #[test]
     fn test_poll_port_from_clipboard_timeout() {
-        let _guard = CLIPBOARD_LOCK.lock().unwrap();
         let dir = tempdir().unwrap();
         let log_file = dir.path().join("log.txt");
         let logger = Logger::new(log_file.clone(), false);
 
-        // Ensure clipboard is empty or non-numeric for timeout test
-        if let Ok(mut cb) = Clipboard::new() {
-            let _ = cb.set_text("not_a_port");
-        }
+        let mut clipboard = FakeClipboard("not_a_port".to_string());
 
         // Test with short duration and 2 attempts for fast execution
         let result = poll_port_from_clipboard_with_interval(
             &logger,
+            &mut clipboard,
             2,
             std::time::Duration::from_millis(10),
         );
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
-            "Failed to find a valid port on clipboard after 30 seconds: Clipboard content is not a valid port number"
+            "Failed to find a valid port on clipboard after 20ms: Clipboard content is not a valid port number"
         );
 
         let log_content = fs::read_to_string(&log_file).unwrap();
         assert!(log_content.contains("Copy VPN forwarding port to continue"));
-        assert!(log_content.contains("Failed to find a valid port on clipboard after 30 seconds"));
+        assert!(log_content.contains("Failed to find a valid port on clipboard after 20ms"));
         // The failure line carries the reason but not the clipboard value.
         assert!(log_content.contains("Clipboard content is not a valid port number"));
         assert!(!log_content.contains("not_a_port"));
@@ -864,24 +965,21 @@ mod tests {
 
     #[test]
     fn test_poll_port_from_clipboard_success_and_clear() {
-        let _guard = CLIPBOARD_LOCK.lock().unwrap();
         let dir = tempdir().unwrap();
         let log_file = dir.path().join("log.txt");
         let logger = Logger::new(log_file.clone(), false);
 
-        if let Ok(mut cb) = Clipboard::new() {
-            let _ = cb.set_text("54321");
-            let result = poll_port_from_clipboard_with_interval(
-                &logger,
-                2,
-                std::time::Duration::from_millis(10),
-            );
-            assert_eq!(result.unwrap(), 54321);
+        let mut clipboard = FakeClipboard("54321".to_string());
+        let result = poll_port_from_clipboard_with_interval(
+            &logger,
+            &mut clipboard,
+            2,
+            std::time::Duration::from_millis(10),
+        );
+        assert_eq!(result.unwrap(), 54321);
 
-            // Verify clipboard was reset
-            let current_cb_text = cb.get_text().unwrap_or_default();
-            assert!(current_cb_text.trim().is_empty());
-        }
+        // Verify clipboard was reset
+        assert!(clipboard.get_text().unwrap().trim().is_empty());
     }
 
     #[test]
